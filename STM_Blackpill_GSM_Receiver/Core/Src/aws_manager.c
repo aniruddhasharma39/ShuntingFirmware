@@ -27,8 +27,8 @@
  * FLASH STORAGE
  * ============================================================ */
 
-#define AWS_FLASH_STORAGE_ADDR    0x08060000U
-#define AWS_FLASH_SECTOR          FLASH_SECTOR_7
+#define AWS_FLASH_STORAGE_ADDR    0x08040000U
+#define AWS_FLASH_SECTOR          FLASH_SECTOR_6
 #define AWS_CREDENTIALS_MAGIC     0x41575343U
 
 static uint32_t GetCompileTimeHash(void)
@@ -429,7 +429,7 @@ bool AWS_CertStorage_Exists(void)
         (AWS_StoredCredentials_t *)AWS_FLASH_STORAGE_ADDR;
 
 
-    if (storage->magic != (AWS_CREDENTIALS_MAGIC ^ GetCompileTimeHash()))
+    if (storage->magic != AWS_CREDENTIALS_MAGIC)
     {
         return false;
     }
@@ -562,7 +562,7 @@ bool AWS_CertStorage_Save(
 
 
     creds.magic =
-        AWS_CREDENTIALS_MAGIC ^ GetCompileTimeHash();
+        AWS_CREDENTIALS_MAGIC;
 
 
     creds.version = 1;
