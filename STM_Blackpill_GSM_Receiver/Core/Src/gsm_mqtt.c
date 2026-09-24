@@ -45,6 +45,7 @@ static GSM_MQTT_IncomingCallback s_incomingCallback = NULL;
 static uint32_t s_lastMessageTick = 0U;
 /* s_lastDistance and DEVICE_PRESENCE_TIMEOUT_MS removed due to warnings/redefinition */
 static uint32_t s_device_last_seen[16] = {0};
+static bool s_device_ever_seen[16] = {false};
 
 static uint32_t lastRxTick = 0U;
 static uint32_t lastPublishTick = 0U;
@@ -1194,6 +1195,7 @@ uint32_t GSM_GetMsSinceLastMessage(uint32_t now)
 bool GSM_IsDeviceOnline(uint8_t device_num, uint32_t now)
 {
     if (device_num >= 16 || device_num == 0) return false;
+    if (!s_device_ever_seen[device_num]) return false;
     /* Device is online if seen within last DEVICE_PRESENCE_TIMEOUT_MS */
     if (now - s_device_last_seen[device_num] < DEVICE_PRESENCE_TIMEOUT_MS) return true;
     return false;
@@ -1203,6 +1205,7 @@ void GSM_MarkDeviceOnline(uint8_t device_num)
 {
     if (device_num < 16 && device_num > 0) {
         s_device_last_seen[device_num] = HAL_GetTick();
+        s_device_ever_seen[device_num] = true;
     }
 }
 

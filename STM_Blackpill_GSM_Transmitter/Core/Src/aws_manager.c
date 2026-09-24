@@ -31,16 +31,6 @@
 #define AWS_FLASH_SECTOR          FLASH_SECTOR_6
 #define AWS_CREDENTIALS_MAGIC     0x41575343U
 
-static uint32_t GetCompileTimeHash(void)
-{
-    const char *buildTime = __DATE__ " " __TIME__;
-    uint32_t hash = 5381;
-    int c;
-    while ((c = *buildTime++)) {
-        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
-    }
-    return hash;
-}
 
 
 typedef struct

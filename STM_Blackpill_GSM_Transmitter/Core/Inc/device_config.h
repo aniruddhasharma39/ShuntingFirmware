@@ -7,8 +7,8 @@
 #define DEVICE_TYPE_STR          "TRANSMITTER"
 
 /* ===== DEVICE IDENTITY ===== */
-#define DEVICE_ID              "TX-01"
-#define DEVICE_SERIAL_NUMBER   "SN-TX-01"
+#define DEVICE_ID              "TX-03"
+#define DEVICE_SERIAL_NUMBER   "SN-TX-03"
 #define DEVICE_NAME            "Shunting Transmitter Test"
 #define DEVICE_HW_VERSION      "1.0"
 #define DEVICE_FW_VERSION      "2.0.0"

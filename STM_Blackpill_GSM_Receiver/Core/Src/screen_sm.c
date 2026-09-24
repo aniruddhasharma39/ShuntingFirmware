@@ -139,15 +139,7 @@ static void PushStatusBar(uint32_t now)
                    (GSM_GetMsSinceLastMessage(now) <= LINK_STALE_TIMEOUT_MS);
     if (link_up) {
         DWIN_WriteVPString(VP_CONN_HEALTH, HEALTH_TEXT[g_hmi.conn_health], HEALTH_TEXT_FIELD_BYTES);
-        /* TEMPORARY (2026-08-30): fake mode display, explicitly requested
-         * — this project has no real LoRa link (GSM-only, see
-         * `## Architecture` in PROGRESS.md), but the status bar shows
-         * "LORA" whenever the live distance reads under 44m and "GSM"
-         * otherwise, purely cosmetic/for demo purposes. Actual link is
-         * always GSM regardless of what this field shows. Revert to the
-         * unconditional `DWIN_WriteVPString(VP_CONN_MODE, "GSM", MODE_TEXT_FIELD_BYTES);`
-         * once this is no longer needed — see PROGRESS.md. */
-        DWIN_WriteVPString(VP_CONN_MODE, (g_hmi.distance_m < DISTANCE_MAX_ACTIVE_M) ? "LORA" : "GSM", MODE_TEXT_FIELD_BYTES);
+        DWIN_WriteVPString(VP_CONN_MODE, "GSM", MODE_TEXT_FIELD_BYTES);
     } else {
         DWIN_WriteVPString(VP_CONN_HEALTH, "--", HEALTH_TEXT_FIELD_BYTES);
         DWIN_WriteVPString(VP_CONN_MODE, "--", MODE_TEXT_FIELD_BYTES);
