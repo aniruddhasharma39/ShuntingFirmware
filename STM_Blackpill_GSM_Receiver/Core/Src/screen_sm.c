@@ -128,25 +128,31 @@ static void PushStatusBar(uint32_t now)
 
     WriteVPPercentText(VP_BATTERY_PCT, g_hmi.battery_pct, NUMBER_TEXT_FIELD_BYTES);
 
-    /* "Connected" on the status bar means real telemetry has actually
-     * arrived recently, not just "the broker session is technically
-     * alive" — a broker session can stay up even while the specific
-     * transmitter this receiver is listening to has gone silent
-     * (powered off, out of range, etc). Showing "GSM/Good" in that
-     * situation would be actively misleading on a collision-avoidance
-     * system, not just cosmetic. */
-    bool link_up = (GSM_GetState() == GSM_LINK_CONNECTED) &&
-                   (GSM_GetMsSinceLastMessage(now) <= LINK_STALE_TIMEOUT_MS);
-    if (link_up) {
-        DWIN_WriteVPString(VP_CONN_HEALTH, HEALTH_TEXT[g_hmi.conn_health], HEALTH_TEXT_FIELD_BYTES);
-        DWIN_WriteVPString(VP_CONN_MODE, "GSM", MODE_TEXT_FIELD_BYTES);
+    if (g_hmi.connected_device_num != 0u) {
+        /* "Connected" on the status bar means real telemetry has actually
+         * arrived recently, not just "the broker session is technically
+         * alive" — a broker session can stay up even while the specific
+         * transmitter this receiver is listening to has gone silent
+         * (powered off, out of range, etc). Showing "GSM/Good" in that
+         * situation would be actively misleading on a collision-avoidance
+         * system, not just cosmetic. */
+        bool link_up = (GSM_GetState() == GSM_LINK_CONNECTED) &&
+                       (GSM_GetMsSinceLastMessage(now) <= LINK_STALE_TIMEOUT_MS);
+        if (link_up) {
+            DWIN_WriteVPString(VP_CONN_HEALTH, HEALTH_TEXT[g_hmi.conn_health], HEALTH_TEXT_FIELD_BYTES);
+            DWIN_WriteVPString(VP_CONN_MODE, "GSM", MODE_TEXT_FIELD_BYTES);
+        } else {
+            DWIN_WriteVPString(VP_CONN_HEALTH, "--", HEALTH_TEXT_FIELD_BYTES);
+            DWIN_WriteVPString(VP_CONN_MODE, "--", MODE_TEXT_FIELD_BYTES);
+        }
+        DWIN_WriteVPString(VP_DEVICE_NAME, g_hmi.connected_device_name, DEVICE_NAME_FIELD_BYTES);
     } else {
-        DWIN_WriteVPString(VP_CONN_HEALTH, "--", HEALTH_TEXT_FIELD_BYTES);
-        DWIN_WriteVPString(VP_CONN_MODE, "--", MODE_TEXT_FIELD_BYTES);
+        DWIN_WriteVPString(VP_CONN_HEALTH, "", HEALTH_TEXT_FIELD_BYTES);
+        DWIN_WriteVPString(VP_CONN_MODE, "", MODE_TEXT_FIELD_BYTES);
+        DWIN_WriteVPString(VP_DEVICE_NAME, "", DEVICE_NAME_FIELD_BYTES);
     }
 
     WriteVPNumberText(VP_VOLUME_PCT, g_hmi.volume_pct, NUMBER_TEXT_FIELD_BYTES);
-    DWIN_WriteVPString(VP_DEVICE_NAME, g_hmi.connected_device_name, DEVICE_NAME_FIELD_BYTES);
 }
 
 static void WriteAllPairingSlots(void)
