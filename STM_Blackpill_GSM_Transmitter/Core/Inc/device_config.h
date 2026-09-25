@@ -4,7 +4,7 @@
 /* ===== DEVICE TYPE (choose ONE) ===== */
 // #define DEVICE_TYPE_RECEIVER     1
 #define DEVICE_TYPE_TRANSMITTER  1
-#define DEVICE_TYPE_STR          "TRANSMITTER 45 MTR"
+#define DEVICE_TYPE_STR          "TRANSMITTER"
 
 /* ===== DEVICE IDENTITY ===== */
 #define DEVICE_ID              "TX-02"
