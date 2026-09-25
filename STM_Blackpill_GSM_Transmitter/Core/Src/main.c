@@ -132,15 +132,15 @@ int main(void)
       {
           GSM_MQTT_Poll();
           AWS_Manager_Tick(HAL_GetTick());
+          /* Ensure Blue LED (PC13, active-low) is solid ON once connected */
+          if (GSM_MQTT_IsConnected()) {
+              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+          }
       }
-
 
       uint16_t dist, strength;
       if (TF02_GetLatest(&dist, &strength)) {
-          if (HAL_GetTick() - lastLidarSend > 250) {   // ~4 readings/sec
-              char msg[32];
-              snprintf(msg, sizeof(msg), "D:%u", (dist + 50) / 100);  // cm -> rounded whole meters
-              // GSM_MQTT_Publish(msg); // Old Mosquitto publish
+          if (HAL_GetTick() - lastLidarSend >= 500) {   // 2 readings/sec (500ms) - optimal for LTE QoS 0
               AWS_PublishTelemetry(dist, 0, 0, false, 0, "OK");
               lastLidarSend = HAL_GetTick();
           }
@@ -272,22 +272,39 @@ static void MX_USART6_UART_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Configure GPIO pin Output Level for PC13 (Blue LED, active low) */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
 
-  /* USER CODE END MX_GPIO_Init_2 */
+  /* Configure GPIO pin : PC13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 }
 
 /* USER CODE BEGIN 4 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    TF02_RxCpltHandler(huart);
+    if (huart->Instance == USART6) {
+        TF02_RxCpltHandler(huart);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART6) {
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        __HAL_UART_CLEAR_NEFLAG(huart);
+        __HAL_UART_CLEAR_FEFLAG(huart);
+        __HAL_UART_CLEAR_PEFLAG(huart);
+        TF02_RxCpltHandler(huart);
+    }
 }
 
 /* __io_putchar was declared `extern ... __attribute__((weak))` in

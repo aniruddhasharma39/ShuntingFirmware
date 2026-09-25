@@ -1344,10 +1344,10 @@ uint8_t AWS_Init(
 
         while (
             !s_provisioningResponseReceived &&
-            (HAL_GetTick() - start) < 15000
+            (HAL_GetTick() - start) < TIMEOUT_PROVISIONING_MS
         )
         {
-            /* Safe: this loop is self-bounded to 15000ms above. */
+            /* Safe: this loop is self-bounded to TIMEOUT_PROVISIONING_MS above. */
 
             GSM_MQTT_Poll();
         }
@@ -1492,10 +1492,10 @@ uint8_t AWS_Init(
 
         while (
             !s_provisioningResponseReceived &&
-            (HAL_GetTick() - start) < 15000
+            (HAL_GetTick() - start) < TIMEOUT_PROVISIONING_MS
         )
         {
-            /* Safe: this loop is self-bounded to 15000ms above. */
+            /* Safe: this loop is self-bounded to TIMEOUT_PROVISIONING_MS above. */
 
             GSM_MQTT_Poll();
         }
@@ -1852,46 +1852,6 @@ void AWS_Manager_Tick(
             now_ms;
 
         AWS_PublishHeartbeat();
-    }
-
-
-    /* --------------------------------------------------------
-     * Telemetry every TELEMETRY_INTERVAL_MS
-     * -------------------------------------------------------- */
-
-    if (
-        now_ms -
-        s_lastTelemetryTick >=
-        TELEMETRY_INTERVAL_MS
-    )
-    {
-        s_lastTelemetryTick =
-            now_ms;
-
-
-        const char *link_str =
-            "DISCONNECTED";
-
-
-        gsm_link_state_t st =
-            GSM_GetState();
-
-
-        if (st ==
-            GSM_LINK_CONNECTED)
-        {
-            link_str =
-                "CONNECTED";
-        }
-        else if (st ==
-                 GSM_LINK_SCANNING)
-        {
-            link_str =
-                "SCANNING";
-        }
-
-
-        AWS_PublishTelemetry(100, 0, 0, false, 20, link_str);
     }
 }
 

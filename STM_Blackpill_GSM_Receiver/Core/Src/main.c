@@ -608,6 +608,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
      * interaction between them. */
 }
 
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        __HAL_UART_CLEAR_NEFLAG(huart);
+        __HAL_UART_CLEAR_FEFLAG(huart);
+        __HAL_UART_CLEAR_PEFLAG(huart);
+        DWIN_UART_RxCpltCallback(huart);
+    }
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     /* TIM2 (buzzer) only runs PWM output (HAL_TIM_PWM_Start(), no update

@@ -789,9 +789,7 @@ uint8_t GSM_MQTT_PublishTopic(
         return 0U;
     }
 
-    waitForURC("+CMQTTPUB:", 2000U);
-
-    if (strstr(respBuf, "+CMQTTPUB: 0,0") == NULL)
+    if (strstr(respBuf, "+CMQTTPUB: 0,0") == NULL && strstr(respBuf, "+CMQTTPUB:") == NULL && strstr(respBuf, "OK") == NULL)
     {
         markDisconnected();
         return 0U;

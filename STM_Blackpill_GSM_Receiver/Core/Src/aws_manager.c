@@ -1442,10 +1442,10 @@ uint8_t AWS_Init(
 
         while (
             !s_provisioningResponseReceived &&
-            (HAL_GetTick() - start) < 15000
+            (HAL_GetTick() - start) < TIMEOUT_PROVISIONING_MS
         )
         {
-            /* Safe: this loop is self-bounded to 15000ms above. */
+            /* Safe: this loop is self-bounded to TIMEOUT_PROVISIONING_MS above. */
 
             GSM_MQTT_Poll();
         }
@@ -1590,10 +1590,10 @@ uint8_t AWS_Init(
 
         while (
             !s_provisioningResponseReceived &&
-            (HAL_GetTick() - start) < 15000
+            (HAL_GetTick() - start) < TIMEOUT_PROVISIONING_MS
         )
         {
-            /* Safe: this loop is self-bounded to 15000ms above. */
+            /* Safe: this loop is self-bounded to TIMEOUT_PROVISIONING_MS above. */
 
             GSM_MQTT_Poll();
         }
