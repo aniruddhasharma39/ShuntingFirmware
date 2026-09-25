@@ -908,18 +908,10 @@ static void AWS_IncomingCallback(
         )
     )
     {
-        const char *thing_start = strstr(payload, "\"thingName\"");
+        const char *thing_start = strstr(payload, "\"thingName\":\"");
         if (thing_start)
         {
-            thing_start += strlen("\"thingName\"");
-            while (*thing_start == ':' || *thing_start == ' ' || *thing_start == '\t' || *thing_start == '\"')
-            {
-                if (*thing_start == '\"') {
-                    thing_start++;
-                    break;
-                }
-                thing_start++;
-            }
+            thing_start += strlen("\"thingName\":\"");
             const char *thing_end = find_json_val_end(thing_start);
             if (thing_end)
             {
@@ -930,12 +922,6 @@ static void AWS_IncomingCallback(
                     s_provisioningThingName[len] = '\0';
                 }
             }
-        }
-
-        if (strlen(s_provisioningThingName) == 0)
-        {
-            strncpy(s_provisioningThingName, DEVICE_ID, sizeof(s_provisioningThingName) - 1);
-            s_provisioningThingName[sizeof(s_provisioningThingName) - 1] = '\0';
         }
 
         dbg("[AWS] Thing provisioned: '%s'\r\n", s_provisioningThingName);

@@ -16,7 +16,7 @@ void HmiState_Init(void)
      * is actually GSM_LINK_CONNECTED, showing "--" until then, so there's
      * no real value in seeding it with a specific enum here. */
     g_hmi.volume_pct = 50u;
-    g_hmi.distance_m = 500u;
+    g_hmi.distance_cm = 50000u;
     strcpy(g_hmi.connected_device_name, "--");
     strcpy(g_hmi.selected_device_name, "--");
 }

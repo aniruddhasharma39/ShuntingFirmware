@@ -41,8 +41,8 @@
 #define LINK_STALE_TIMEOUT_MS       15000u
 
 /* Outer edge of the "actively approaching" range — beyond this, the
- * telemetry screen shows "--" instead of a number. */
-#define DISTANCE_MAX_ACTIVE_M           44u
+ * telemetry screen shows "OR" instead of a number. */
+#define DISTANCE_MAX_ACTIVE_CM       4500u /* 45.00 meters */
 
 /* Obstacle-warning overlay (page 14) — new feature, not from CLAUDE.md.
  * Pops up automatically when the LiDAR sees a sudden distance drop
@@ -51,8 +51,8 @@
  * TickObstacleOverlay()'s own comment for the detection/recovery design.
  * Ported from Shunting_Receiver_v2's already-hardware-tuned values, not
  * re-derived here. */
-#define OBSTACLE_DROP_THRESHOLD_M            5u
-#define OBSTACLE_CONFIRM_HOLD_MS           2000u
+#define OBSTACLE_DROP_THRESHOLD_CM    500u /* 5.00 meters */
+#define OBSTACLE_CONFIRM_HOLD_MS     2000u
 
 /* Text-field widths below are inferred, not given by CLAUDE.md — verify
  * against each VP's configured character count in DWIN Designer. A too-
@@ -461,10 +461,12 @@ static void TickPeriodicPushes(uint32_t now)
          * the same "--". */
         if (GsmLinkDown(now)) {
             DWIN_WriteVPString(VP_DISTANCE, "DC", NUMBER_TEXT_FIELD_BYTES);
-        } else if (g_hmi.distance_m > DISTANCE_MAX_ACTIVE_M) {
+        } else if (g_hmi.distance_cm > DISTANCE_MAX_ACTIVE_CM) {
             DWIN_WriteVPString(VP_DISTANCE, "OR", NUMBER_TEXT_FIELD_BYTES);
         } else {
-            WriteVPNumberText(VP_DISTANCE, g_hmi.distance_m, NUMBER_TEXT_FIELD_BYTES);
+            char dist_str[16];
+            snprintf(dist_str, sizeof(dist_str), "%u.%02u", g_hmi.distance_cm / 100u, g_hmi.distance_cm % 100u);
+            DWIN_WriteVPString(VP_DISTANCE, dist_str, NUMBER_TEXT_FIELD_BYTES);
         }
     }
 
@@ -504,14 +506,14 @@ static void TickConnectionStatus(uint32_t now)
     }
 }
 
-/* Drains whatever GSM has most recently parsed into g_hmi.distance_m.
+/* Drains whatever GSM has most recently parsed into g_hmi.distance_cm.
  * Unread-since-last-call flag on the GSM side, so this never picks up a
  * stale leftover reading from before a device change. */
 static void TickDistanceFromLinks(void)
 {
-    uint16_t gsm_distance_m;
-    if (GSM_GetLatestDistance(&gsm_distance_m)) {
-        g_hmi.distance_m = gsm_distance_m;
+    uint16_t gsm_distance_cm;
+    if (GSM_GetLatestDistance(&gsm_distance_cm)) {
+        g_hmi.distance_cm = gsm_distance_cm;
     }
 }
 
@@ -583,7 +585,7 @@ static bool GsmLinkDown(uint32_t now)
  * delta trigger, not specific to recovery.) */
 static void TickObstacleOverlay(uint32_t now)
 {
-    static uint16_t s_last_distance_m;
+    static uint16_t s_last_distance_cm;
     static bool     s_have_last_distance;
     static bool     s_pending;
     static uint32_t s_pending_since_tick;
@@ -605,14 +607,14 @@ static void TickObstacleOverlay(uint32_t now)
     if (!s_have_last_distance) {
         /* First sample since telemetry began (or resumed) — just
          * establishes the baseline, never evaluated as a drop/rise. */
-        s_last_distance_m = g_hmi.distance_m;
+        s_last_distance_cm = g_hmi.distance_cm;
         s_have_last_distance = true;
-    } else if (g_hmi.distance_m != s_last_distance_m) {
-        uint16_t prev = s_last_distance_m;
-        uint16_t cur = g_hmi.distance_m;
-        bool prev_was_real = (prev <= DISTANCE_MAX_ACTIVE_M);
-        bool sudden_drop = prev_was_real && (prev > cur) && ((prev - cur) >= OBSTACLE_DROP_THRESHOLD_M);
-        bool sudden_rise = prev_was_real && (cur > prev) && ((cur - prev) >= OBSTACLE_DROP_THRESHOLD_M);
+    } else if (g_hmi.distance_cm != s_last_distance_cm) {
+        uint16_t prev = s_last_distance_cm;
+        uint16_t cur = g_hmi.distance_cm;
+        bool prev_was_real = (prev <= DISTANCE_MAX_ACTIVE_CM);
+        bool sudden_drop = prev_was_real && (prev > cur) && ((prev - cur) >= OBSTACLE_DROP_THRESHOLD_CM);
+        bool sudden_rise = prev_was_real && (cur > prev) && ((cur - prev) >= OBSTACLE_DROP_THRESHOLD_CM);
 
         if (g_hmi.obstacle_overlay_active) {
             if (sudden_rise) {
@@ -628,7 +630,7 @@ static void TickObstacleOverlay(uint32_t now)
             s_pending_since_tick = now;
         }
 
-        s_last_distance_m = cur;
+        s_last_distance_cm = cur;
     }
 
     /* Runs every tick regardless of whether this particular sample
@@ -703,21 +705,21 @@ static void TickBuzzer(uint32_t now)
     }
     Buzzer_SetContinuousTone(false);
 
-    uint32_t d = g_hmi.distance_m;
-    if (d > DISTANCE_MAX_ACTIVE_M) {
+    uint32_t d_cm = g_hmi.distance_cm;
+    if (d_cm > DISTANCE_MAX_ACTIVE_CM) {
         Buzzer_SetBeepIntervalMs(0u); /* out of range entirely — fully silent */
         return;
     }
 
     uint32_t interval_ms;
-    if (d < 5u) {
-        interval_ms = 150u; /* dead-end warning */
-    } else if (d < 10u) {
+    if (d_cm < 500u) {          /* < 5.00m: dead-end warning */
+        interval_ms = 150u;
+    } else if (d_cm < 1000u) {  /* < 10.00m */
         interval_ms = 200u;
-    } else if (d < 20u) {
+    } else if (d_cm < 2000u) {  /* < 20.00m */
         interval_ms = 250u;
     } else {
-        interval_ms = 400u; /* 20-44m — outermost active tier */
+        interval_ms = 400u;     /* 20.00 - 45.00m — outermost active tier */
     }
     Buzzer_SetBeepIntervalMs(interval_ms);
 }
@@ -735,7 +737,7 @@ void ScreenSM_ForceStartupReset(uint32_t now_ms)
     strcpy(g_hmi.connected_device_name, "--");
     memset(g_hmi.device_online, 0, sizeof(g_hmi.device_online));
     g_hmi.conn_health = CONN_HEALTH_POOR;
-    g_hmi.distance_m = 500u; /* same "no data yet" fallback as HmiState_Init() */
+    g_hmi.distance_cm = 50000u; /* same "no data yet" fallback as HmiState_Init() */
     EnterScreen(SCR_00_STARTUP, true, now_ms);
 }
 

@@ -62,7 +62,7 @@ typedef struct {
 
     /* -- GSM link telemetry, real (owned by screen_sm.c, sourced from
      * gsm_mqtt.c's GSM_GetLatestDistance()/GetState()) -- */
-    uint16_t       distance_m;
+    uint16_t       distance_cm;
     conn_health_t  conn_health;
 
     /* -- volume, real (owned by screen_sm.c, set directly by touch input) -- */

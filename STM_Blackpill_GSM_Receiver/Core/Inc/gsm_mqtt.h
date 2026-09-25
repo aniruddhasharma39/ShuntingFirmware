@@ -160,7 +160,7 @@ bool GSM_IsDeviceOnline(uint8_t device_num, uint32_t now);
 
 void GSM_Reset(void);
 void GSM_MarkDeviceOnline(uint8_t device_num);
-void GSM_SetLatestDistance(uint8_t device_num, uint16_t distance_m);
+void GSM_SetLatestDistance(uint8_t device_num, uint16_t distance_cm);
 
 
 #ifdef __cplusplus

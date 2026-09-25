@@ -1132,7 +1132,7 @@ void GSM_MQTT_Poll(void)
 
 static uint8_t  s_connected_device_num = 0U;
 static uint16_t s_device_distance[16] = {0};
-static uint16_t s_latest_distance = 500U;
+static uint16_t s_latest_distance = 50000U;
 static bool     s_has_latest_distance = false;
 
 void GSM_BeginConnect(uint8_t selected_device_num)
@@ -1156,16 +1156,16 @@ void GSM_Disconnect(void)
     s_has_latest_distance = false;
 }
 
-void GSM_SetLatestDistance(uint8_t device_num, uint16_t distance_m)
+void GSM_SetLatestDistance(uint8_t device_num, uint16_t distance_cm)
 {
     if (device_num < 16 && device_num > 0)
     {
-        s_device_distance[device_num] = distance_m;
+        s_device_distance[device_num] = distance_cm;
         s_lastMessageTick = HAL_GetTick();
 
         if (s_connected_device_num == 0 || s_connected_device_num == device_num)
         {
-            s_latest_distance = distance_m;
+            s_latest_distance = distance_cm;
             s_has_latest_distance = true;
         }
     }

@@ -1045,8 +1045,7 @@ static void AWS_IncomingCallback(
                                 long dist_cm = strtol(d_pos, NULL, 10);
                                 if (dist_cm >= 0 && dist_cm <= 65535)
                                 {
-                                    uint16_t dist_m = (uint16_t)((dist_cm + 50) / 100);
-                                    GSM_SetLatestDistance(device_num, dist_m);
+                                    GSM_SetLatestDistance(device_num, (uint16_t)dist_cm);
                                 }
                             }
                         }
@@ -2032,7 +2031,7 @@ void AWS_Manager_Tick(
                 "SCANNING";
         }
 
-        uint16_t dist_cm = (uint16_t)(g_hmi.distance_m * 100U);
+        uint16_t dist_cm = g_hmi.distance_cm;
         AWS_PublishTelemetry(
             dist_cm,
             g_hmi.connected_device_num,
