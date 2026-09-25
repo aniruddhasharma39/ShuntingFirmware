@@ -4,11 +4,11 @@
 /* ===== DEVICE TYPE (choose ONE) ===== */
 // #define DEVICE_TYPE_RECEIVER     1
 #define DEVICE_TYPE_TRANSMITTER  1
-#define DEVICE_TYPE_STR          "TRANSMITTER"
+#define DEVICE_TYPE_STR          "TRANSMITTER 45 MTR"
 
 /* ===== DEVICE IDENTITY ===== */
-#define DEVICE_ID              "TX-03"
-#define DEVICE_SERIAL_NUMBER   "SN-TX-03"
+#define DEVICE_ID              "TX-02"
+#define DEVICE_SERIAL_NUMBER   "SN-TX-02"
 #define DEVICE_NAME            "Shunting Transmitter Test"
 #define DEVICE_HW_VERSION      "1.0"
 #define DEVICE_FW_VERSION      "2.0.0"

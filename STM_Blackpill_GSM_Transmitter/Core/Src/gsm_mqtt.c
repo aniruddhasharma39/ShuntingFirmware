@@ -620,6 +620,7 @@ static uint8_t moduleAlive(void)
 static uint8_t fullReconnect(void)
 {
     sendAT("ATE0", CMD_TIMEOUT);
+    sendAT("AT+CSCLK=0", CMD_TIMEOUT);
 
     if (!waitForNetwork())
         return 0U;
@@ -676,6 +677,7 @@ uint8_t GSM_MQTT_Init(
 
     sendAT("AT", CMD_TIMEOUT);
     sendAT("ATE0", CMD_TIMEOUT);
+    sendAT("AT+CSCLK=0", CMD_TIMEOUT);
     sendAT("AT+CPIN?", CMD_TIMEOUT);
     sendAT("AT+CSQ", CMD_TIMEOUT);
 

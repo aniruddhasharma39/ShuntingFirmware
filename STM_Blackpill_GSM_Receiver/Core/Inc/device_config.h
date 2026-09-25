@@ -7,8 +7,8 @@
 #define DEVICE_TYPE_STR          "RECEIVER"
 
 /* ===== DEVICE IDENTITY ===== */
-#define DEVICE_ID              "RX-03"
-#define DEVICE_SERIAL_NUMBER   "SN-RX-03"
+#define DEVICE_ID              "RX-01"
+#define DEVICE_SERIAL_NUMBER   "SN-RX-01"
 #define DEVICE_NAME            "Shunting Receiver Test"
 #define DEVICE_HW_VERSION      "1.0"
 #define DEVICE_FW_VERSION      "2.0.0"
