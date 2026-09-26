@@ -191,7 +191,8 @@ static void PushStatusBar(uint32_t now)
          * already live from an earlier session). */
         bool link_up;
         if (g_hmi.conn_mode == CONN_MODE_LORA) {
-            link_up = (LoRa_GetState() == LORA_LINK_STABLE);
+            link_up = (LoRa_GetState() == LORA_LINK_STABLE) || 
+                      (LoRa_GetState() == LORA_LINK_LISTENING && LoRa_GetWindowSuccessCount() >= 1u);
         } else {
             link_up = (GSM_GetState() == GSM_LINK_CONNECTED) &&
                       (GSM_GetMsSinceLastMessage(now) <= LINK_STALE_TIMEOUT_MS);
@@ -221,7 +222,7 @@ static void WriteAllPairingSlots(void)
             uint8_t dev = (uint8_t)(PAIRING_PAGES[p].start_device + slot);
             uint16_t vp = PAIRING_PAGES[p].vp[slot];
             if (g_hmi.device_online[dev - 1u]) {
-                snprintf(name, sizeof(name), "D-%02u", dev);
+                snprintf(name, sizeof(name), "TX-%02u", dev);
                 DWIN_WriteVPString(vp, name, PAIRING_SLOT_NAME_FIELD_BYTES);
             } else {
                 DWIN_WriteVPString(vp, "", PAIRING_SLOT_NAME_FIELD_BYTES);
@@ -342,7 +343,7 @@ static void HandleTouch(uint16_t code, uint32_t now)
     if (code >= TOUCH_DEVICE_SELECT_MIN && code <= TOUCH_DEVICE_SELECT_MAX) {
         if (IsPairingScreen(g_hmi.active_screen) && g_hmi.device_online[code - 1u]) {
             g_hmi.selected_device_num = (uint8_t)code;
-            snprintf(g_hmi.selected_device_name, sizeof(g_hmi.selected_device_name), "D-%02u", (unsigned)code);
+            snprintf(g_hmi.selected_device_name, sizeof(g_hmi.selected_device_name), "TX-%02u", (unsigned)code);
             EnterScreen(SCR_10_CONFIRM_SELECTION, true, now);
         }
         return;
@@ -616,12 +617,12 @@ static void TickPeriodicPushes(uint32_t now)
  * numerically with the cloud path's time-based scale. */
 static void TickConnectionStatus(uint32_t now)
 {
-    if (LoRa_GetState() == LORA_LINK_STABLE) {
+    uint8_t lora_success = LoRa_GetWindowSuccessCount();
+    if (LoRa_GetState() == LORA_LINK_STABLE || (LoRa_GetState() == LORA_LINK_LISTENING && lora_success >= 1u)) {
         g_hmi.conn_mode = CONN_MODE_LORA;
-        uint8_t success = LoRa_GetWindowSuccessCount();
-        if (success >= 5u) {
+        if (lora_success >= 5u) {
             g_hmi.conn_health = CONN_HEALTH_EXCELLENT;
-        } else if (success >= 4u) {
+        } else if (lora_success >= 4u) {
             g_hmi.conn_health = CONN_HEALTH_GOOD;
         } else {
             g_hmi.conn_health = CONN_HEALTH_POOR; /* defensive — the dead
