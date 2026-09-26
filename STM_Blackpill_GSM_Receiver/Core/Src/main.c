@@ -88,7 +88,8 @@ static void MX_USART6_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+#include <stdbool.h>
+bool g_system_initialized = false;
 /* USER CODE END 0 */
 
 /**
@@ -172,6 +173,7 @@ int main(void)
   uint32_t awsRetryIntervalMs = AWS_RETRY_BASE_MS;
   uint32_t lastAwsReconnectTick   = 0;
   uint32_t awsReconnectIntervalMs = AWS_RECONNECT_BASE_MS;
+  g_system_initialized = true;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -711,6 +713,24 @@ int __io_putchar(int ch)
 {
     (void)ch;
     return ch;
+}
+
+void HAL_Delay(uint32_t Delay)
+{
+    uint32_t tickstart = HAL_GetTick();
+    uint32_t wait = Delay;
+    if (wait < HAL_MAX_DELAY)
+    {
+        wait += (uint32_t)(uwTickFreq);
+    }
+    while ((HAL_GetTick() - tickstart) < wait)
+    {
+        extern bool g_system_initialized;
+        if (g_system_initialized) {
+            LoRa_Poll(HAL_GetTick());
+            ScreenSM_Tick(HAL_GetTick());
+        }
+    }
 }
 /* USER CODE END 4 */
 
