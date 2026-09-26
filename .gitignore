@@ -1,17 +1,12 @@
-﻿# STM32CubeIDE Build outputs
+# STM32CubeIDE build output
 Debug/
 Release/
-*.o
-*.d
-*.su
-*.cyclo
 *.elf
 *.bin
 *.hex
 *.map
 *.list
-
-# Temporary files
-*.tmp
-*~
-.DS_Store
+*.o
+*.d
+*.su
+*.cyclo

@@ -70,19 +70,48 @@ uint8_t AWS_RegisterDevice(void);
 
 
 /* ------------------------------------------------------------
- * TELEMETRY
+ * TELEMETRY & OFFLINE QUEUE
  * ------------------------------------------------------------ */
+
+typedef struct {
+    uint32_t uptime_s;
+    uint16_t distance_cm;
+    uint8_t  selected_target_id;
+    uint8_t  battery_pct;
+    bool     is_charging;
+    int8_t   gsm_rssi;
+    char     link_state[16];
+    bool     is_lora;
+} OfflineTelemetry_t;
+
+bool AWS_OfflineQueue_Push(const OfflineTelemetry_t *rec);
+bool AWS_OfflineQueue_Pop(OfflineTelemetry_t *rec);
+uint16_t AWS_OfflineQueue_Count(void);
+
+/*
+ * Publish device telemetry to AWS IoT with explicit isLoRa and uptime_s.
+ */
+uint8_t AWS_PublishTelemetryEx(
+    uint16_t distance_cm,
+    uint8_t selected_target_id,
+    uint8_t battery_pct,
+    bool is_charging,
+    int8_t gsm_rssi,
+    const char *link_state,
+    bool is_lora,
+    uint32_t uptime_s
+);
 
 /*
  * Publish device telemetry to AWS IoT.
  */
 uint8_t AWS_PublishTelemetry(
-    uint16_t messageId,
-    uint8_t signalStrength,
-    uint8_t gpsFixType,
-    bool isEngineRunning,
-    int8_t speedKmH,
-    const char *locationStr
+    uint16_t distance_cm,
+    uint8_t selected_target_id,
+    uint8_t battery_pct,
+    bool is_charging,
+    int8_t gsm_rssi,
+    const char *link_state
 );
 
 

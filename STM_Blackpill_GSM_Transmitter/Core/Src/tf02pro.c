@@ -59,3 +59,7 @@ uint8_t TF02_GetLatest(uint16_t *distance_cm, uint16_t *strength) {
     dataReady = 0;
     return 1;
 }
+
+uint16_t TF02_GetDistance_cm(void) {
+    return latestDistance;
+}

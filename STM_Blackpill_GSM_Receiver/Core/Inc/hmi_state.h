@@ -1,9 +1,12 @@
 /* Single shared state struct for the receiver HMI. Ported from
- * Shunting_Receiver_v2's hmi_state.h, trimmed to this project's scope (no
- * LoRa). GSM+DWIN+buzzer fields are owned by screen_sm.c; battery_soc.c
- * owns the real battery field; charger_detect.c owns the charger fields
- * — same ownership split as the source project. Nothing here talks to
- * hardware directly.
+ * Shunting_Receiver_v2's hmi_state.h. GSM/LoRa+DWIN+buzzer fields are
+ * owned by screen_sm.c; battery_soc.c owns the real battery field.
+ * Nothing here talks to hardware directly.
+ *
+ * NOTE for anyone trimming this struct: aws_manager.c (protected — it must
+ * not be edited) reads g_hmi.distance_cm, g_hmi.connected_device_num,
+ * g_hmi.battery_pct and g_hmi.charger_plugged directly when it publishes
+ * the receiver's telemetry, so those four fields must keep existing.
  */
 #ifndef HMI_STATE_H
 #define HMI_STATE_H
@@ -28,7 +31,12 @@ typedef enum {
     SCR_10_CONFIRM_SELECTION,
     SCR_11_END_SHUNTING,
     SCR_12_SHUNTING_COMPLETED,
-    SCR_13_CHARGER_PLUGGED,
+    SCR_13_CHARGER_PLUGGED, /* unused since on-board charger detection was
+                                removed (the pack is charged externally) —
+                                kept only because screen_id_t values map 1:1
+                                onto DGUS page IDs (see screen_sm.c's
+                                PageIdFor()), so removing it would renumber
+                                the entries after it */
     SCR_14_OBSTACLE_WARNING,
     SCR_COUNT
 } screen_id_t;
@@ -39,41 +47,50 @@ typedef enum {
     CONN_HEALTH_EXCELLENT = 2
 } conn_health_t;
 
+/* Which link is currently the authoritative telemetry source — LoRa is
+ * preferred whenever the selected transmitter is in range, AWS/GSM is the
+ * fallback. Set by screen_sm.c's TickConnectionStatus(). */
+typedef enum {
+    CONN_MODE_GSM = 0,
+    CONN_MODE_LORA = 1
+} conn_mode_t;
+
 typedef struct {
     /* -- navigation (owned by screen_sm.c) -- */
     screen_id_t active_screen;
     uint32_t    screen_entered_tick;
     uint32_t    connecting_start_tick;
-    bool        charger_overlay_active;  /* true while page 13 is covering active_screen */
     bool        obstacle_overlay_active; /* true while page 14 is covering active_screen
                                              (active_screen itself stays SCR_04_TELEMETRY
-                                             throughout, same overlay technique as charger) */
+                                             throughout) */
 
     /* -- pairing / device selection (owned by screen_sm.c) -- */
     uint8_t     selected_device_num;                    /* 1-45, 0 = none */
     char        selected_device_name[HMI_DEVICE_NAME_LEN];
     uint8_t     connected_device_num;                   /* 0 = not connected */
     char        connected_device_name[HMI_DEVICE_NAME_LEN];
-    bool        device_online[HMI_MAX_DEVICES];          /* real presence,
-                                                              from GSM_IsDeviceOnline() */
+    bool        device_online[HMI_MAX_DEVICES];          /* real presence, merged
+                                                              from GSM_IsDeviceOnline()
+                                                              and LoRa_IsDeviceOnline() */
 
     /* -- battery, real (owned by battery_soc.c, INA226-derived) -- */
     uint8_t        battery_pct;
 
-    /* -- GSM link telemetry, real (owned by screen_sm.c, sourced from
-     * gsm_mqtt.c's GSM_GetLatestDistance()/GetState()) -- */
+    /* -- link telemetry, real (owned by screen_sm.c, sourced from
+     * gsm_mqtt.c's GSM_GetLatestDistance()/GetState() and lora_e220.c's
+     * LoRa_GetLatestDistance()/GetState(), whichever is authoritative) -- */
     uint16_t       distance_cm;
     conn_health_t  conn_health;
+    conn_mode_t    conn_mode;
 
     /* -- volume, real (owned by screen_sm.c, set directly by touch input) -- */
     uint8_t        volume_pct;
 
-    /* -- charger, real (owned by charger_detect.c, dual-channel ADC
-     * sensing) -- */
-    bool    charger_plugged;    /* charger-present flag, ~1.0V threshold */
-    bool    charger_near_full;  /* near-full flag, ~2.0V threshold */
-    uint8_t charge_pct;         /* mirrors battery_pct, capped at 99 until
-                                    charger_near_full is true */
+    /* -- charger: on-board charger detection was removed (the pack is
+     * charged externally) and nothing writes this anymore, so it stays
+     * false forever. The field itself must remain: aws_manager.c (protected)
+     * still passes it to AWS_PublishTelemetry() as the "is_charging" flag. -- */
+    bool    charger_plugged;
 } hmi_state_t;
 
 extern hmi_state_t g_hmi;

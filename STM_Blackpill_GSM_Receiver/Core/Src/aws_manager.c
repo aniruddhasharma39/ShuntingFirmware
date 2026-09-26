@@ -1896,16 +1896,58 @@ uint8_t AWS_RegisterDevice(void)
 
 
 /* ============================================================
+ * OFFLINE QUEUE
+ * ============================================================ */
+
+#define OFFLINE_QUEUE_CAPACITY 128
+
+static OfflineTelemetry_t s_offlineQueue[OFFLINE_QUEUE_CAPACITY];
+static uint16_t s_offlineHead = 0;
+static uint16_t s_offlineTail = 0;
+static uint16_t s_offlineCount = 0;
+
+bool AWS_OfflineQueue_Push(const OfflineTelemetry_t *rec)
+{
+    if (rec == NULL) return false;
+    if (s_offlineCount >= OFFLINE_QUEUE_CAPACITY) {
+        /* Drop oldest item to make room */
+        s_offlineTail = (s_offlineTail + 1u) % OFFLINE_QUEUE_CAPACITY;
+        s_offlineCount--;
+    }
+    s_offlineQueue[s_offlineHead] = *rec;
+    s_offlineHead = (s_offlineHead + 1u) % OFFLINE_QUEUE_CAPACITY;
+    s_offlineCount++;
+    return true;
+}
+
+bool AWS_OfflineQueue_Pop(OfflineTelemetry_t *rec)
+{
+    if (rec == NULL || s_offlineCount == 0) return false;
+    *rec = s_offlineQueue[s_offlineTail];
+    s_offlineTail = (s_offlineTail + 1u) % OFFLINE_QUEUE_CAPACITY;
+    s_offlineCount--;
+    return true;
+}
+
+uint16_t AWS_OfflineQueue_Count(void)
+{
+    return s_offlineCount;
+}
+
+
+/* ============================================================
  * TELEMETRY
  * ============================================================ */
 
-uint8_t AWS_PublishTelemetry(
+uint8_t AWS_PublishTelemetryEx(
     uint16_t distance_cm,
     uint8_t selected_target_id,
     uint8_t battery_pct,
     bool is_charging,
     int8_t gsm_rssi,
-    const char *link_state
+    const char *link_state,
+    bool is_lora,
+    uint32_t uptime_s
 )
 {
     char telem_payload[512];
@@ -1916,31 +1958,59 @@ uint8_t AWS_PublishTelemetry(
         "\"deviceId\":\"%s\","
         "\"productType\":\"%s\","
         "\"uptime_s\":%lu,"
+        "\"isLoRa\":%s,"
         "\"readings\":{"
             "\"distance_cm\":%u,"
-            "\"selected_target_id\":%u"
+            "\"selected_target_id\":%u,"
+            "\"isLoRa\":%s"
         "},"
         "\"diagnostics\":{"
             "\"battery_pct\":%u,"
             "\"is_charging\":%s,"
             "\"gsm_rssi\":%d,"
             "\"link_state\":\"%s\","
-            "\"status\":\"ONLINE\""
+            "\"status\":\"ONLINE\","
+            "\"isLoRa\":%s"
         "}"
         "}",
         DEVICE_ID,
         DEVICE_TYPE_STR,
-        (unsigned long)(HAL_GetTick() / 1000U),
+        (unsigned long)uptime_s,
+        is_lora ? "true" : "false",
         distance_cm,
         selected_target_id,
+        is_lora ? "true" : "false",
         battery_pct,
         is_charging ? "true" : "false",
         gsm_rssi,
-        link_state ? link_state : "CONNECTED"
+        link_state ? link_state : "CONNECTED",
+        is_lora ? "true" : "false"
     );
     char telem_topic[128];
     snprintf(telem_topic, sizeof(telem_topic), "devices/%s/telemetry", DEVICE_ID);
     return GSM_MQTT_PublishTopic(telem_topic, telem_payload);
+}
+
+uint8_t AWS_PublishTelemetry(
+    uint16_t distance_cm,
+    uint8_t selected_target_id,
+    uint8_t battery_pct,
+    bool is_charging,
+    int8_t gsm_rssi,
+    const char *link_state
+)
+{
+    bool is_lora = (g_hmi.conn_mode == CONN_MODE_LORA);
+    return AWS_PublishTelemetryEx(
+        distance_cm,
+        selected_target_id,
+        battery_pct,
+        is_charging,
+        gsm_rssi,
+        link_state,
+        is_lora,
+        HAL_GetTick() / 1000U
+    );
 }
 
 
@@ -1954,10 +2024,6 @@ void AWS_Manager_Tick(
     uint32_t now_ms
 )
 {
-    if (!s_isProvisioned)
-    {
-        return;
-    }
 
 
     bool isConnected = GSM_MQTT_IsConnected();
@@ -1973,12 +2039,88 @@ void AWS_Manager_Tick(
     }
     s_wasConnected = isConnected;
 
+    /* --------------------------------------------------------
+     * Telemetry check every 10 seconds (online or offline)
+     * -------------------------------------------------------- */
+    if (
+        now_ms -
+        s_lastTelemetryTick >=
+        10000U
+    )
+    {
+        s_lastTelemetryTick = now_ms;
 
-    if (!isConnected)
+        const char *link_str = "DISCONNECTED";
+        gsm_link_state_t st = GSM_GetState();
+
+        if (g_hmi.conn_mode == CONN_MODE_LORA)
+        {
+            link_str = "LORA";
+        }
+        else if (st == GSM_LINK_CONNECTED)
+        {
+            link_str = "CONNECTED";
+        }
+        else if (st == GSM_LINK_SCANNING)
+        {
+            link_str = "SCANNING";
+        }
+
+        bool is_lora = (g_hmi.conn_mode == CONN_MODE_LORA);
+        uint16_t dist_cm = g_hmi.distance_cm;
+
+        if (isConnected && s_isProvisioned)
+        {
+            /* Drain any queued offline records first */
+            OfflineTelemetry_t queued_rec;
+            while (AWS_OfflineQueue_Pop(&queued_rec))
+            {
+                AWS_PublishTelemetryEx(
+                    queued_rec.distance_cm,
+                    queued_rec.selected_target_id,
+                    queued_rec.battery_pct,
+                    queued_rec.is_charging,
+                    queued_rec.gsm_rssi,
+                    queued_rec.link_state,
+                    queued_rec.is_lora,
+                    queued_rec.uptime_s
+                );
+                HAL_Delay(50);
+            }
+
+            /* Publish current live telemetry */
+            AWS_PublishTelemetryEx(
+                dist_cm,
+                g_hmi.connected_device_num,
+                g_hmi.battery_pct,
+                g_hmi.charger_plugged,
+                20,
+                link_str,
+                is_lora,
+                now_ms / 1000U
+            );
+        }
+        else
+        {
+            /* Offline (LoRa active or GSM down): queue for upload when reconnected */
+            OfflineTelemetry_t rec;
+            rec.uptime_s = now_ms / 1000U;
+            rec.distance_cm = dist_cm;
+            rec.selected_target_id = g_hmi.connected_device_num;
+            rec.battery_pct = g_hmi.battery_pct;
+            rec.is_charging = g_hmi.charger_plugged;
+            rec.gsm_rssi = 0;
+            strncpy(rec.link_state, link_str, sizeof(rec.link_state) - 1);
+            rec.link_state[sizeof(rec.link_state) - 1] = '\0';
+            rec.is_lora = is_lora;
+            AWS_OfflineQueue_Push(&rec);
+        }
+    }
+
+    if (!isConnected || !s_isProvisioned)
     {
         return;
     }
-
 
     /* --------------------------------------------------------
      * Status Heartbeat every 30 seconds
@@ -1989,59 +2131,11 @@ void AWS_Manager_Tick(
         30000U
     )
     {
-        s_lastHeartbeatTick =
-            now_ms;
-
+        s_lastHeartbeatTick = now_ms;
         AWS_PublishHeartbeat();
     }
-
-
-    /* --------------------------------------------------------
-     * Telemetry every 10 seconds
-     * -------------------------------------------------------- */
-
-    if (
-        now_ms -
-        s_lastTelemetryTick >=
-        10000U
-    )
-    {
-        s_lastTelemetryTick =
-            now_ms;
-
-
-        const char *link_str =
-            "DISCONNECTED";
-
-
-        gsm_link_state_t st =
-            GSM_GetState();
-
-
-        if (st ==
-            GSM_LINK_CONNECTED)
-        {
-            link_str =
-                "CONNECTED";
-        }
-        else if (st ==
-                 GSM_LINK_SCANNING)
-        {
-            link_str =
-                "SCANNING";
-        }
-
-        uint16_t dist_cm = g_hmi.distance_cm;
-        AWS_PublishTelemetry(
-            dist_cm,
-            g_hmi.connected_device_num,
-            g_hmi.battery_pct,
-            g_hmi.charger_plugged,
-            20,
-            link_str
-        );
-    }
 }
+
 
 
 

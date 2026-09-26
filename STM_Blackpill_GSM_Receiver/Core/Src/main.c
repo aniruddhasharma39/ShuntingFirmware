@@ -29,7 +29,8 @@
 #include "screen_sm.h"
 #include "buzzer.h"
 #include "battery_soc.h"
-#include "charger_detect.h"
+#include "lora_e220.h"
+#include "modem_gate.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -39,7 +40,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* AWS_Init() retry pacing (see the main loop): 5s is the MASTER PROMPT 9.2
+ * base interval, doubled after each failed attempt up to the cap. */
+#define AWS_RETRY_BASE_MS    5000U
+#define AWS_RETRY_MAX_MS    60000U
+/* Reconnect pacing after a dropped session. Must exceed GSM_MQTT_Poll()'s own
+ * internal 5s reconnect throttle (strict ">") or a call could be swallowed. */
+#define AWS_RECONNECT_BASE_MS  6000U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -57,6 +64,7 @@ TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart6;
 
 
 /* USER CODE BEGIN PV */
@@ -72,6 +80,7 @@ static void MX_TIM2_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_USART6_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
 
@@ -116,6 +125,7 @@ int main(void)
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_TIM3_Init();
+  MX_USART6_UART_Init();
 
   /* USER CODE BEGIN 2 */
   HmiState_Init();
@@ -125,96 +135,129 @@ int main(void)
                             which assumes the timer handle is already
                             bound. Matches Shunting_Receiver_v2's relative
                             ordering (Buzzer_Init() before ScreenSM_Init()). */
-  ScreenSM_Init();   /* sends the 00_Startup page-jump now, before the
-                         blocking GSM connect below, so the display shows
-                         something immediately at power-on instead of
-                         staying blank through the whole (possibly long)
-                         cold-boot GSM connect sequence. Side effect: the
-                         literal "3-second startup hold" spec only holds
-                         true on later, warm transitions (e.g.
-                         12_Shunting_Completed -> 00_Startup) — on this
-                         very first cold boot the Startup screen stays up
-                         for the entire GSM_MQTT_Init() call below, then
-                         advances on the first main-loop tick once it
-                         returns. No logic change needed for this; it
-                         falls out of the ordering alone. */
+  ScreenSM_Init();   /* sends the 00_Startup page-jump now, before any of
+                         this project's blocking hardware inits, so the
+                         display shows something immediately at power-on.
+                         AWS_Init() is NOT called here any more — it
+                         moved into the main loop (see the retry block
+                         below) so it can never hold the Startup screen up
+                         or freeze LoRa/touch handling for its whole
+                         (possibly minutes-long) connect sequence. */
   BatterySoc_Init(&hi2c1);       /* after ScreenSM_Init() too, for the same
-                                     reason as GSM_MQTT_Init() below — this
-                                     blocks ~500ms for sensor settle, and
-                                     the Startup screen should already be
-                                     showing before any of this project's
-                                     blocking hardware inits run. Must run
-                                     before ChargerDetect_Init(), which
-                                     seeds charge_pct from g_hmi.battery_pct. */
-  ChargerDetect_Init(&hadc1, &htim3);   /* binds TIM3 and starts it in
-                                            interrupt mode — from this point
-                                            on, charger detection runs from
-                                            ChargerDetect_TimerCallback(),
-                                            not the main loop. See
-                                            charger_detect.h/PROGRESS.md
-                                            for why. */
+                                     reason — this blocks ~500ms for sensor
+                                     settle, and the Startup screen should
+                                     already be showing before any of this
+                                     project's blocking hardware inits run. */
+  /* No boot-time E220 configuration-mode switch: M0/M1 (PA4/PA1) are held
+   * LOW (Normal/transparent mode) by MX_GPIO_Init() and nothing ever
+   * changes them. A boot-time configuration write was tried in the
+   * standalone project and removed — it was the likely cause of the
+   * module's saved settings reverting to factory defaults and of an
+   * intermittent total link loss; the link runs reliably (1.5km tested)
+   * with the module simply left in Normal mode. */
+  LoRa_Init(&huart6);   /* arms interrupt-driven RX on the LoRa UART
+                            (USART6, PA11/PA12). Doesn't talk to the module,
+                            so it's harmless to call before PA5 (the MOSFET
+                            powering the E220 + GSM modem) has settled. */
 
-
-
-  /* Give ChargerDetect_TimerCallback() (already running via the
-   * HAL_TIM_Base_Start_IT() call inside ChargerDetect_Init() above) time
-   * to take its first couple of ADC samples and settle its debounce
-   * before deciding whether g_hmi.charger_plugged reflects reality yet —
-   * worst case is ~200ms (two present-channel round-robin samples plus   * CHARGER_DEBOUNCE_MS), 300ms gives comfortable margin. Needed because
-   * on this hardware a charger plugged in while the system is fully
-   * off can itself power the STM32 on via a separate circuit, bypassing
-   * the normal system switch entirely — so charger_plugged can already
-   * be the real, physical state right here at boot, not just something
-   * that happens later while already running. */
-  HAL_Delay(300);
-
-  /* Skip the blocking GSM connect sequence entirely if the charger is
-   * already present at this point: PA5 cuts GSM's power while charging
-   * (see charger_detect.h/PROGRESS.md), so the module has no power to
-   * respond to any of this anyway — every AT command would just time
-   * out, taking a long time to fail for no benefit, and worse, blocks
-   * the main loop from ever starting, which is what was leaving the
-   * charge-percentage text stuck on its template placeholder in this
-   * exact boot path (the charging *page* still switched correctly, via
-   * ChargerDetect_TimerCallback()'s own ISR-side nudge, but
-   * TickChargerOverlay() — the only thing that ever writes the
-   * percentage — never got a chance to run before the main loop even
-   * began). gsm_inited tracks whether this actually ran; if skipped
-   * here, it's run once, deferred, the first time the charger is
-   * unplugged (see USER CODE BEGIN WHILE below) — GSM still needs to
-   * come up at some point once real operation begins, just not blocking
-   * this specific boot path. */
-  bool gsm_inited = false;
-  // TEMPORARY BYPASS FOR DEV BOARD TESTING
-  // if (!g_hmi.charger_plugged) {
-      if (AWS_Init(&huart2, "airtelgprs.com")) {
-          gsm_inited = true;
-      }
-  // }
+  /* AWS IoT Core / GSM bring-up is retried from inside the main loop,
+   * never blocked on here: AWS_Init() can run for minutes (modem boot,
+   * network registration, fleet provisioning), and LoRa_Poll(), the touch
+   * handling and the buzzer all live in that same loop. Same non-blocking
+   * retry pattern the transmitter already uses; AWS_Init() itself is called
+   * exactly as before (same arguments, never modified — see MASTER PROMPT
+   * section 9). */
+  bool     aws_inited         = false;
+  uint32_t lastAwsRetryTick   = 0;
+  uint32_t awsRetryIntervalMs = AWS_RETRY_BASE_MS;
+  uint32_t lastAwsReconnectTick   = 0;
+  uint32_t awsReconnectIntervalMs = AWS_RECONNECT_BASE_MS;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      // wasted AT-command attempts against a dead module.
-      // TickChargerOverlay() (inside ScreenSM_Tick()) handles the
-      // fresh-start reset on unplug.
-      if (!gsm_inited) {
-          // GSM_MQTT_Init() was deliberately skipped above because the
-          // charger was already plugged in at boot (see USER CODE BEGIN
-          // 2) — bring GSM up now, exactly once, the first time the
-          // charger is unplugged and real operation actually begins.
-          // TEMPORARY BYPASS FOR DEV BOARD TESTING
-          // if (!g_hmi.charger_plugged) {
-              if (AWS_Init(&huart2, "airtelgprs.com")) {
-                  gsm_inited = true;
-              } else {
-                  HAL_Delay(5000); // Wait before retrying
+      LoRa_Poll(HAL_GetTick());   /* first, every iteration, independent of
+                                      GSM/AWS state — LoRa presence tracking
+                                      and the rolling link window must never
+                                      wait behind the cellular bring-up
+                                      below. Its own timestamp, deliberately
+                                      NOT the `now` captured further down
+                                      (which must stay AFTER
+                                      GSM_MQTT_Poll() — see that capture's
+                                      own comment). */
+
+      if (!aws_inited) {
+          /* Non-blocking retry, MASTER PROMPT 9.2 shape, with three
+           * additions on top of the plain fixed 5s timer:
+           *  1. Not before the Startup screen has finished — a single
+           *     AWS_Init() call has no yield points, so attempting it on
+           *     the first iteration would freeze the loop (and with it
+           *     ScreenSM_Tick()'s hold timer) until it returns.
+           *  2. Not while a LoRa session is live (a transmitter selected:
+           *     LISTENING/STABLE) — a failed attempt can block for minutes,
+           *     which would stall LoRa_Poll() and the obstacle buzzer
+           *     mid-shunt. AWS then simply comes up the next time the
+           *     receiver is back on the pairing screens.
+           *  3. ModemGate_SimReady() first: two ordinary AT commands (~2s
+           *     worst case) that skip a hopeless attempt outright when the
+           *     modem is silent or there is no SIM. Replaces the standalone
+           *     project's fullReconnect() SIM check, which can't live here
+           *     because gsm_mqtt.c is protected.
+           * Every failed attempt doubles the wait (5s -> 10s -> ... -> 60s
+           * cap) so an uncovered or SIM-less unit doesn't keep freezing the
+           * loop; the wait is measured from the END of the attempt so a
+           * long attempt is always followed by real loop time. */
+          if ((g_hmi.active_screen != SCR_00_STARTUP) &&
+              (LoRa_GetState() == LORA_LINK_IDLE) &&
+              ((HAL_GetTick() - lastAwsRetryTick) >= awsRetryIntervalMs)) {
+              if (ModemGate_SimReady(&huart2)) {
+                  aws_inited = AWS_Init(&huart2, "airtelgprs.com");
               }
-          // }
-      } else { // TEMPORARY BYPASS FOR DEV BOARD TESTING: replaced "} else if (!g_hmi.charger_plugged) {"
-          GSM_MQTT_Poll();
+              lastAwsRetryTick = HAL_GetTick();
+              if (aws_inited) {
+                  awsRetryIntervalMs = AWS_RETRY_BASE_MS;
+              } else if (awsRetryIntervalMs < AWS_RETRY_MAX_MS) {
+                  awsRetryIntervalMs *= 2U;
+                  if (awsRetryIntervalMs > AWS_RETRY_MAX_MS) {
+                      awsRetryIntervalMs = AWS_RETRY_MAX_MS;
+                  }
+              }
+          }
+      } else {
+          if (GSM_MQTT_IsConnected()) {
+              GSM_MQTT_Poll();
+              awsReconnectIntervalMs = AWS_RECONNECT_BASE_MS;
+          } else if ((g_hmi.active_screen != SCR_00_STARTUP) &&
+                     (LoRa_GetState() == LORA_LINK_IDLE) &&
+                     ((HAL_GetTick() - lastAwsReconnectTick) >= awsReconnectIntervalMs)) {
+              /* Session dropped (coverage loss, failed publish, modem
+               * reset...). With no MQTT session GSM_MQTT_Poll() does nothing
+               * but run its own reconnect — fullReconnect(), a blocking
+               * sequence that can hold the loop for a minute or more (network
+               * wait, TLS connect...) and, when it fails, is retried
+               * again straight away. Called unconditionally that would mean
+               * one loop iteration per minute for as long as the outage
+               * lasts: no LoRa tracking, no touch handling, no buzzer.
+               * Same rules as the first-connect retry above: only from the
+               * pairing screens (never while a transmitter is selected —
+               * LoRa alone must keep working through a cellular outage),
+               * only when the modem is up with a SIM, and backing off
+               * 6s -> 12s -> ... -> 60s after each failure. */
+              if (ModemGate_SimReady(&huart2)) {
+                  GSM_MQTT_Poll();   /* not connected: runs its reconnect */
+              }
+              lastAwsReconnectTick = HAL_GetTick();
+              if (GSM_MQTT_IsConnected()) {
+                  awsReconnectIntervalMs = AWS_RECONNECT_BASE_MS;
+              } else {
+                  awsReconnectIntervalMs *= 2U;
+                  if (awsReconnectIntervalMs > AWS_RETRY_MAX_MS) {
+                      awsReconnectIntervalMs = AWS_RETRY_MAX_MS;
+                  }
+              }
+          }
           AWS_Manager_Tick(HAL_GetTick());
       }
       /* `now` must be captured AFTER GSM_MQTT_Poll() returns, not before —
@@ -231,10 +274,6 @@ int main(void)
        * "--" for exactly one tick before the next iteration's fresh,
        * correctly-ordered `now` recovered it. */
       uint32_t now = HAL_GetTick();
-      // ChargerDetect no longer ticks here — it's fully timer-interrupt-
-      // driven now (TIM3 -> HAL_TIM_PeriodElapsedCallback() -> see
-      // USER CODE BEGIN 4 below), decoupled from GSM_MQTT_Poll()'s
-      // blocking behavior. See charger_detect.h/PROGRESS.md for why.
       BatterySoc_Tick(now);
       ScreenSM_Tick(now);
       Buzzer_Tick(now);
@@ -547,6 +586,39 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * @brief USART6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART6_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART6_Init 0 */
+
+  /* USER CODE END USART6_Init 0 */
+
+  /* USER CODE BEGIN USART6_Init 1 */
+
+  /* USER CODE END USART6_Init 1 */
+  huart6.Instance = USART6;
+  huart6.Init.BaudRate = 115200;
+  huart6.Init.WordLength = UART_WORDLENGTH_8B;
+  huart6.Init.StopBits = UART_STOPBITS_1;
+  huart6.Init.Parity = UART_PARITY_NONE;
+  huart6.Init.Mode = UART_MODE_TX_RX;
+  huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART6_Init 2 */
+
+  /* USER CODE END USART6_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -575,13 +647,14 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
 
-  /*Configure GPIO pins : PA5 PA8 */
-  GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_8;
+  /*Configure GPIO pins : PA1 PA4 PA5 PA8 (PA1/PA4 = E220 M1/M0, held LOW =
+    Normal mode, never driven anywhere else) */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_8;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -601,11 +674,14 @@ static void MX_GPIO_Init(void)
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     DWIN_UART_RxCpltCallback(huart);
+    LoRa_UART_RxCpltCallback(huart);
     /* GSM stays fully blocking/polled in this project (unchanged, proven
      * behavior) — it has no *_UART_RxCpltCallback of its own, so no
-     * dispatch fan-out is needed here for it. USART1 (DWIN) and USART2
-     * (GSM) are electrically and logically independent; no NVIC/priority
-     * interaction between them. */
+     * dispatch fan-out is needed here for it. USART1 (DWIN), USART2 (GSM)
+     * and USART6 (LoRa) are electrically and logically independent; no
+     * NVIC/priority interaction between them. Each dispatched function
+     * checks huart against its own stored handle and no-ops if it doesn't
+     * match, so calling both unconditionally here is safe. */
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -617,19 +693,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         __HAL_UART_CLEAR_PEFLAG(huart);
         DWIN_UART_RxCpltCallback(huart);
     }
-}
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    /* TIM2 (buzzer) only runs PWM output (HAL_TIM_PWM_Start(), no update
-     * interrupt enabled) — this callback only ever actually fires for
-     * TIM3, but the explicit instance check is cheap and keeps this safe
-     * if that ever changes. See charger_detect.h/PROGRESS.md for why
-     * charger detection is timer-interrupt-driven instead of a main-loop
-     * _Tick() like everything else in this project. */
-    if (htim->Instance == TIM3) {
-        ChargerDetect_TimerCallback();
-    }
+    LoRa_UART_ErrorCallback(huart);   /* no-ops unless huart is USART6 */
 }
 
 /* __io_putchar was declared `extern ... __attribute__((weak))` in

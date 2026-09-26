@@ -24,4 +24,13 @@ void TF02_RxCpltHandler(UART_HandleTypeDef *huart);
  * only written when this returns 1. */
 uint8_t TF02_GetLatest(uint16_t *distance_cm, uint16_t *strength);
 
+/* Returns the most recently parsed distance unconditionally (0 before
+ * the first valid frame), independent of TF02_GetLatest()'s own "new
+ * since last call" flag — added for lora_tx.c, which needs the current
+ * distance on every ~1Hz broadcast tick regardless of whether the
+ * AWS telemetry path in main.c has already consumed the latest reading
+ * via TF02_GetLatest(). Reading this never affects TF02_GetLatest()'s own
+ * state, so the AWS path is unaffected. */
+uint16_t TF02_GetDistance_cm(void);
+
 #endif /* TF02PRO_H */

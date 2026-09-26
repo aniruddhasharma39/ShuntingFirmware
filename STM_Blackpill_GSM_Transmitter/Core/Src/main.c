@@ -25,6 +25,8 @@
 #include "tf02pro.h"
 #include "gsm_mqtt.h"
 #include "aws_manager.h"
+#include "lora_tx.h"
+#include "modem_gate.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,8 +45,12 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim2;
+
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart6;
+DMA_HandleTypeDef hdma_usart1_tx;
 
 
 /* USER CODE BEGIN PV */
@@ -54,8 +60,11 @@ UART_HandleTypeDef huart6;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART6_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_TIM2_Init(void);
 
 /* USER CODE BEGIN PFP */
 
@@ -95,13 +104,42 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_USART6_UART_Init();
+  MX_USART1_UART_Init();
+  MX_TIM2_Init();
 
   /* USER CODE BEGIN 2 */
-  bool aws_inited = AWS_Init(&huart2, "airtelgprs.com");
-  uint32_t lastAwsRetryTick = HAL_GetTick();
+  /* Lidar + LoRa come up BEFORE the (blocking) AWS_Init() attempt below,
+   * not after it: both are interrupt/DMA driven, so once started they keep
+   * running while AWS_Init() sits in its long modem-boot / network-
+   * registration / provisioning waits. With no SIM or no coverage that can
+   * be minutes, and LoRa is the receiver's cellular-independent link to
+   * this transmitter — it must be on the air from the first second. */
   TF02_Init(&huart6);
+  LoRaTx_Init(&huart1);   /* TX-only broadcast on its own UART (USART1,
+                              PA9/PA10, DMA2 Stream7); parses this unit's
+                              number out of DEVICE_ID. */
+  HAL_TIM_Base_Start_IT(&htim2);   /* 1Hz LoRa send from
+                              HAL_TIM_PeriodElapsedCallback() below — fully
+                              independent of the main loop, so a stalled
+                              AWS_Init()/GSM call can never delay or skip a
+                              broadcast (see lora_tx.h). Must run after
+                              LoRaTx_Init() so the first interrupt (~1s
+                              from now) always has a bound UART. */
+
+  /* AWS_Init() itself is unchanged and still called exactly as before. It
+   * is now only attempted when ModemGate_SimReady() says the modem is up
+   * and a SIM is present — otherwise a silent modem or missing SIM would
+   * burn a full blocking attempt (up to minutes) that can never succeed.
+   * The retry block in the main loop below applies the same gate. */
+  bool aws_inited = false;
+  if (ModemGate_SimReady(&huart2))
+  {
+      aws_inited = AWS_Init(&huart2, "airtelgprs.com");
+  }
+  uint32_t lastAwsRetryTick = HAL_GetTick();
   uint32_t lastLidarSend = 0;
   /* USER CODE END 2 */
 
@@ -125,7 +163,10 @@ int main(void)
           if (HAL_GetTick() - lastAwsRetryTick >= 5000U)
           {
               lastAwsRetryTick = HAL_GetTick();
-              aws_inited = AWS_Init(&huart2, "airtelgprs.com");
+              if (ModemGate_SimReady(&huart2))
+              {
+                  aws_inited = AWS_Init(&huart2, "airtelgprs.com");
+              }
           }
       }
       else
@@ -141,7 +182,21 @@ int main(void)
       uint16_t dist, strength;
       if (TF02_GetLatest(&dist, &strength)) {
           if (HAL_GetTick() - lastLidarSend >= 500) {   // 2 readings/sec (500ms) - optimal for LTE QoS 0
-              AWS_PublishTelemetry(dist, 0, 0, false, 0, "OK");
+              if (GSM_MQTT_IsConnected()) {
+                  AWS_PublishTelemetry(dist, 0, 0, false, 0, "OK");
+              } else {
+                  OfflineTelemetry_t rec;
+                  rec.uptime_s = HAL_GetTick() / 1000U;
+                  rec.distance_cm = dist;
+                  rec.selected_target_id = 0;
+                  rec.battery_pct = 100;
+                  rec.is_charging = false;
+                  rec.gsm_rssi = 0;
+                  strncpy(rec.link_state, "LORA", sizeof(rec.link_state) - 1);
+                  rec.link_state[sizeof(rec.link_state) - 1] = '\0';
+                  rec.is_lora = false;
+                  AWS_OfflineQueue_Push(&rec);
+              }
               lastLidarSend = HAL_GetTick();
           }
       }
@@ -197,7 +252,83 @@ void SystemClock_Config(void)
   }
 }
 
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
 
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 9599;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 9999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
 
 /**
   * @brief USART2 Initialization Function
@@ -266,6 +397,22 @@ static void MX_USART6_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -288,6 +435,19 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* Configure GPIO pin Output Level for PA1/PA4 (LoRa M1/M0, LOW=Normal Mode) and PA5/PA8 (Power/Enable, HIGH) */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_4, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5|GPIO_PIN_8, GPIO_PIN_SET);
+
+  /* Configure GPIO pins : PA1 PA4 PA5 PA8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
 }
 
 /* USER CODE BEGIN 4 */
@@ -304,6 +464,18 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
         __HAL_UART_CLEAR_FEFLAG(huart);
         __HAL_UART_CLEAR_PEFLAG(huart);
         TF02_RxCpltHandler(huart);
+    }
+}
+
+/* Fires once a second, forever, from TIM2 — see lora_tx.h's header comment
+ * and the HAL_TIM_Base_Start_IT(&htim2) call site above for the full
+ * reasoning. Deliberately minimal: LoRaTx_Tick() itself only builds a small
+ * buffer and kicks off a DMA transfer (HAL_UART_Transmit_DMA()), it never
+ * blocks — so this interrupt handler finishes in a few microseconds
+ * regardless of what the main loop (AWS_Init()/GSM included) is doing. */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM2) {
+        LoRaTx_Tick();
     }
 }
 

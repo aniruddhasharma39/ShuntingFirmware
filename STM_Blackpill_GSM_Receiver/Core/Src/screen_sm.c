@@ -3,22 +3,50 @@
 #include "hmi_map.h"
 #include "dwin_hmi.h"
 #include "gsm_mqtt.h"
+#include "lora_e220.h"
 #include "buzzer.h"
 #include <stdio.h>
 #include <string.h>
 
 /* ---- timing constants (see CLAUDE.md screen-flow section in the source
- * project for the ones that are spec, not just demo pacing: 3s startup
- * hold, 20s connect timeout, 2s shunting-completed hold) --------------- */
-#define STARTUP_HOLD_MS               3000u
+ * project for the ones that are spec, not just demo pacing: originally 3s
+ * startup hold, 20s connect timeout, 2s shunting-completed hold) ------- */
+#define STARTUP_HOLD_MS               5000u  /* 5s rather than the 3s spec:
+    the battery boot-time voltage read (battery_soc.c) needs ~3.5s after
+    power-on to publish a real percentage, and the status bar (which shows
+    it) only starts being pushed once this screen is left — a 3s hold would
+    let it flash the placeholder 0% for a moment. Also long enough for the
+    modem to get past its worst boot noise before the first AWS attempt
+    (see main.c, which holds that attempt until this screen is left). */
 #define CONNECTING_TIMEOUT_MS        20000u
 #define SHUNTING_COMPLETED_HOLD_MS    2000u
 #define ERROR_HOLD_MS                 3000u
 
+/* LoRa-priority connect race: the AWS/GSM path typically becomes ready
+ * (a heartbeat/telemetry message from the selected transmitter) within a
+ * second or two once the MQTT session is up, while LoRa's rolling window
+ * needs a mandatory minimum of LORA_WINDOW_SIZE * LORA_SLOT_INTERVAL_MS
+ * (5 * 1500 = 7500ms, in lora_e220.c) before it can ever report
+ * LORA_LINK_STABLE, however good the signal is. Without a grace window the
+ * cloud link would win the race almost every time regardless of "LoRa
+ * checked first" in the code, which is the opposite of what's wanted:
+ * LoRa is the preferred link whenever the selected device is actually in
+ * range, with AWS/GSM only as the fallback for when it isn't. See
+ * ConnectionIsReady(). */
+#define LORA_PRIORITY_GRACE_MS       10000u  /* generous margin over LoRa's
+    own ~7500ms minimum fill time — a genuinely in-range device reaches
+    STABLE within this window and wins; the cloud link is never accepted
+    before it, as long as LoRa has shown ANY presence for this device */
+#define LORA_NO_SIGNAL_GRACE_MS       3000u  /* if LoRa hasn't heard a
+    single frame from the selected device within this much shorter
+    window, it's reasonably certain that device isn't reachable over
+    LoRa right now at all (the transmitter sends roughly once a second) —
+    no reason to make the operator wait the full LORA_PRIORITY_GRACE_MS in
+    that case; the cloud link is accepted as soon as it's ready instead. */
+
 #define STATUS_PUSH_INTERVAL_MS        300u
 #define TELEMETRY_DISTANCE_PUSH_MS     150u
 #define PAIRING_BG_REFRESH_MS         5000u
-#define CHARGE_TEXT_PUSH_INTERVAL_MS  1000u
 
 /* How long without an actual distance message before the status bar
  * stops showing the link as up, even though the receiver's own broker
@@ -63,11 +91,7 @@
 #define CONFIRM_NAME_FIELD_BYTES        16u
 #define NUMBER_TEXT_FIELD_BYTES          8u
 #define HEALTH_TEXT_FIELD_BYTES         12u /* fits "Excellent" */
-#define MODE_TEXT_FIELD_BYTES            8u /* fits "GSM" — this port is
-                                                 GSM-only, but the field
-                                                 stays in case a future
-                                                 link type is added */
-#define CHARGE_PCT_TEXT_FIELD_BYTES      8u
+#define MODE_TEXT_FIELD_BYTES            8u /* fits "GSM" and "LORA" */
 
 /* Distance/volume were originally sent as raw 16-bit binary VP writes
  * (DWIN_WriteVP16) and rendered as garbage or blank on hardware —
@@ -79,6 +103,25 @@ static void WriteVPNumberText(uint16_t vp, uint32_t value, uint8_t field_bytes)
     char buf[12];
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)value);
     DWIN_WriteVPString(vp, buf, field_bytes);
+}
+
+/* Telemetry distance readout, in metres (explicit request): from 10m up it
+ * is shown as whole metres ("23"); below 10m it gets one decimal, in
+ * half-metre steps only — "9.5", "9.0", "8.5"... — so the last digit is
+ * always 0 or 5. Both round to the NEAREST step (a reading of 9.75m or more
+ * therefore already shows "10"). Only formats; the underlying g_hmi
+ * distance stays in centimetres, and the buzzer bands / obstacle detection
+ * keep working from the exact value, not from this rounded text. */
+static void FormatDistanceText(char *out, size_t out_len, uint16_t cm)
+{
+    uint32_t half_metres = ((uint32_t)cm + 25u) / 50u;   /* nearest 0.5m */
+    if (half_metres < 20u) {
+        snprintf(out, out_len, "%lu.%c",
+                 (unsigned long)(half_metres / 2u),
+                 (half_metres & 1u) ? '5' : '0');
+    } else {
+        snprintf(out, out_len, "%lu", (unsigned long)(((uint32_t)cm + 50u) / 100u));
+    }
 }
 
 /* Same as WriteVPNumberText() but appends "%" — used for battery/charge
@@ -129,18 +172,33 @@ static void PushStatusBar(uint32_t now)
     WriteVPPercentText(VP_BATTERY_PCT, g_hmi.battery_pct, NUMBER_TEXT_FIELD_BYTES);
 
     if (g_hmi.connected_device_num != 0u) {
-        /* "Connected" on the status bar means real telemetry has actually
-         * arrived recently, not just "the broker session is technically
-         * alive" — a broker session can stay up even while the specific
-         * transmitter this receiver is listening to has gone silent
-         * (powered off, out of range, etc). Showing "GSM/Good" in that
-         * situation would be actively misleading on a collision-avoidance
-         * system, not just cosmetic. */
-        bool link_up = (GSM_GetState() == GSM_LINK_CONNECTED) &&
-                       (GSM_GetMsSinceLastMessage(now) <= LINK_STALE_TIMEOUT_MS);
+        /* "Connected" on the status bar means the actual end-to-end link is
+         * up for whichever transport is currently authoritative
+         * (g_hmi.conn_mode, set by TickConnectionStatus()) — real telemetry
+         * has actually arrived recently, not just "the broker session is
+         * technically alive": a broker session can stay up even while the
+         * specific transmitter this receiver is listening to has gone
+         * silent (powered off, out of range, etc). Showing "GSM/Good" or
+         * "LORA/Best" in that situation would be actively misleading on a
+         * collision-avoidance system, not just cosmetic.
+         *
+         * Only reached once connected_device_num is set, and that only ever
+         * happens inside CommitConnectionAndShowTelemetry() — i.e. after
+         * ConnectionIsReady() has genuinely decided a link is up — so
+         * g_hmi.conn_mode is never a stale leftover from a previous
+         * connection here (this used to flash "GSM/Best" for a moment on
+         * entering the connecting screen when the cloud subscription was
+         * already live from an earlier session). */
+        bool link_up;
+        if (g_hmi.conn_mode == CONN_MODE_LORA) {
+            link_up = (LoRa_GetState() == LORA_LINK_STABLE);
+        } else {
+            link_up = (GSM_GetState() == GSM_LINK_CONNECTED) &&
+                      (GSM_GetMsSinceLastMessage(now) <= LINK_STALE_TIMEOUT_MS);
+        }
         if (link_up) {
             DWIN_WriteVPString(VP_CONN_HEALTH, HEALTH_TEXT[g_hmi.conn_health], HEALTH_TEXT_FIELD_BYTES);
-            DWIN_WriteVPString(VP_CONN_MODE, "GSM", MODE_TEXT_FIELD_BYTES);
+            DWIN_WriteVPString(VP_CONN_MODE, (g_hmi.conn_mode == CONN_MODE_GSM) ? "GSM" : "LoRa", MODE_TEXT_FIELD_BYTES);
         } else {
             DWIN_WriteVPString(VP_CONN_HEALTH, "--", HEALTH_TEXT_FIELD_BYTES);
             DWIN_WriteVPString(VP_CONN_MODE, "--", MODE_TEXT_FIELD_BYTES);
@@ -172,11 +230,13 @@ static void WriteAllPairingSlots(void)
     }
 }
 
-/* GSM-only presence (this port has no LoRa) — a device counts as online
- * if a presence response has been heard from it recently. */
+/* Real presence, merged across both links — a device counts as online
+ * if either the AWS heartbeat/telemetry path or the LoRa broadcast has
+ * heard from it recently. LoRa alone is enough, so the pairing screens
+ * keep working with no cellular coverage at all. */
 static bool DeviceIsOnline(uint8_t device_num, uint32_t now)
 {
-    return GSM_IsDeviceOnline(device_num, now);
+    return GSM_IsDeviceOnline(device_num, now) || LoRa_IsDeviceOnline(device_num, now);
 }
 
 static void RefreshPairingSlots(uint32_t now)
@@ -204,12 +264,11 @@ static void EnterScreen(screen_id_t target, bool send_page_cmd, uint32_t now)
     g_hmi.active_screen = target;
     g_hmi.screen_entered_tick = now;
 
-    /* While the charger or obstacle overlay is covering the display,
-     * suppress the page jump so that overlay's page stays visible —
-     * logical navigation still happens underneath, and
-     * TickChargerOverlay()/TickObstacleOverlay() jump to the right page
-     * once the overlay clears. */
-    if (send_page_cmd && !g_hmi.charger_overlay_active && !g_hmi.obstacle_overlay_active) {
+    /* While the obstacle overlay is covering the display, suppress the
+     * page jump so that overlay's page stays visible — logical navigation
+     * still happens underneath, and TickObstacleOverlay() jumps to the
+     * right page once the overlay clears. */
+    if (send_page_cmd && !g_hmi.obstacle_overlay_active) {
         DWIN_SwitchPage(PageIdFor(target));
     }
 
@@ -234,11 +293,17 @@ static void EnterScreen(screen_id_t target, bool send_page_cmd, uint32_t now)
 
         case SCR_02_CONNECTING:
             g_hmi.connecting_start_tick = now;
-            /* GSM is the only link in this port — this call performs the
-             * (blocking, bounded by the driver's own CMD_TIMEOUT/
-             * URC_WAIT_TIMEOUT) per-device subscribe on top of the
-             * already-up baseline session. */
+            /* Both links start racing from here — whichever proves
+             * itself ready first wins (see ConnectionIsReady() below).
+             * LoRa only ever wins this race if its rolling window fills
+             * with a genuinely good success rate within a few seconds,
+             * which in practice only happens when already in range — the
+             * AWS/GSM path is the fallback for everything else.
+             * GSM_BeginConnect() just records which transmitter's
+             * telemetry to track (the baseline wildcard subscriptions are
+             * already up); LoRa_BeginListen() is non-blocking. */
             GSM_BeginConnect(g_hmi.selected_device_num);
+            LoRa_BeginListen(g_hmi.selected_device_num);
             break;
 
         default:
@@ -287,6 +352,7 @@ static void HandleTouch(uint16_t code, uint32_t now)
         case SCR_09_CHANGE_DEVICE:
             if (code == TOUCH_CHANGE_DEVICE_YES) {
                 GSM_Disconnect(); /* actually sever the connection, per CLAUDE.md */
+                LoRa_StopListen();
                 g_hmi.connected_device_num = 0u;
                 strcpy(g_hmi.connected_device_name, "--");
                 EnterScreen(SCR_01_PAIRING_P1, false, now); /* DGUS already jumped */
@@ -312,6 +378,7 @@ static void HandleTouch(uint16_t code, uint32_t now)
         case SCR_11_END_SHUNTING:
             if (code == TOUCH_END_SHUNTING_YES) {
                 GSM_Disconnect(); /* actually sever the connection, per CLAUDE.md */
+                LoRa_StopListen();
                 g_hmi.connected_device_num = 0u;
                 strcpy(g_hmi.connected_device_name, "--");
                 EnterScreen(SCR_12_SHUNTING_COMPLETED, false, now);
@@ -366,8 +433,49 @@ static bool GsmHasRealTelemetry(uint32_t now)
            GSM_GetMsSinceLastMessage(now) != UINT32_MAX;
 }
 
+/* LoRa gets explicit priority over the AWS/GSM path, not just "checked
+ * first". A plain `LoRa STABLE || GsmHasRealTelemetry()` would check LoRa
+ * first in the code but not actually favour it: LORA_LINK_STABLE needs a
+ * mandatory ~7.5s minimum to ever become true (the rolling window's
+ * cold-start guard — see LORA_PRIORITY_GRACE_MS's comment), while the
+ * cloud link is usually ready well inside that window, so in practice the
+ * cloud would win almost every time and LoRa would only take over a few
+ * seconds later on the Telemetry screen — the opposite of what's wanted.
+ * So the cloud link isn't accepted at all until either (a) LoRa has shown
+ * zero presence for this device within LORA_NO_SIGNAL_GRACE_MS (clearly not
+ * reachable over LoRa right now — no reason to make the operator wait), or
+ * (b) LoRa has been given the full LORA_PRIORITY_GRACE_MS and still hasn't
+ * reached STABLE (signal present but too marginal to trust).
+ *
+ * This only decides when the SCREEN may act on the cloud link already being
+ * ready; it never touches the AWS/GSM connection itself. Once connected,
+ * TickConnectionStatus() keeps preferring LORA_LINK_STABLE every tick for as
+ * long as the session lasts, so a session that started on the cloud link
+ * (device briefly out of LoRa range) hands over to LoRa automatically the
+ * moment it comes back into range. */
 static bool ConnectionIsReady(uint32_t now)
 {
+    if (LoRa_GetState() == LORA_LINK_STABLE) {
+        return true;
+    }
+
+    /* If GSM is not connected and LoRa has received multiple frames for target, connect directly */
+    if (GSM_GetState() != GSM_LINK_CONNECTED) {
+        if (LoRa_GetWindowSuccessCount() >= 2u) {
+            return true;
+        }
+    }
+
+    uint32_t connecting_elapsed = now - g_hmi.connecting_start_tick;
+    if (connecting_elapsed < LORA_NO_SIGNAL_GRACE_MS) {
+        return false; /* too soon to tell either way — keep waiting */
+    }
+
+    bool lora_signal_present = LoRa_IsDeviceOnline(g_hmi.selected_device_num, now);
+    if (lora_signal_present && connecting_elapsed < LORA_PRIORITY_GRACE_MS) {
+        return false; /* LoRa is visible and still has time to reach STABLE */
+    }
+
     return GsmHasRealTelemetry(now);
 }
 
@@ -392,18 +500,18 @@ static void TickTimers(uint32_t now)
             /* CLAUDE.md's 20s UI timeout is shorter than a real GSM
              * connect sequence can legitimately take (individual AT
              * steps can run up to 60s each), so while still sitting on
-             * this screen, GSM keeps trying in the background rather
-             * than being aborted — an attempt that's just slow (not
-             * actually failed) still recovers automatically instead of
-             * stranding the locopilot here. Recovery is checked first,
-             * same priority order as the hold-timer pattern elsewhere
-             * (e.g. 02_Connecting) — if the link comes up right as the
-             * hold is about to expire, it still wins. */
+             * this screen, both links keep trying in the background
+             * rather than being aborted — an attempt that's just slow
+             * (not actually failed) still recovers automatically instead
+             * of stranding the locopilot here. Recovery is checked
+             * first, same priority order as the hold-timer pattern
+             * elsewhere (e.g. 02_Connecting) — if the link comes up
+             * right as the hold is about to expire, it still wins. */
             if (ConnectionIsReady(now)) {
                 CommitConnectionAndShowTelemetry(now);
             } else if (now - g_hmi.screen_entered_tick >= ERROR_HOLD_MS) {
                 /* Once we actually leave for the pairing screen, the
-                 * attempt must stop for real — otherwise GSM keeps
+                 * attempt must stop for real — otherwise GSM/LoRa keep
                  * retrying the old device in the background, and a
                  * reconnect succeeding later (e.g. the transmitter
                  * getting powered back on) would silently show up on
@@ -411,6 +519,7 @@ static void TickTimers(uint32_t now)
                  * user action taken. Same cleanup as the explicit
                  * Change Device / End Shunting paths. */
                 GSM_Disconnect();
+                LoRa_StopListen();
                 g_hmi.selected_device_num = 0u;
                 EnterScreen(SCR_01_PAIRING_P1, true, now);
             }
@@ -427,12 +536,12 @@ static void TickTimers(uint32_t now)
     }
 }
 
-/* True only when GSM can't actually deliver telemetry right now — reuses
- * the exact same "is this link actually live" criteria already
+/* True only when NEITHER link can actually deliver telemetry right now —
+ * reuses the exact same "is this link actually live" criteria already
  * established for the status bar (PushStatusBar()'s link_up), not a new
  * concept. Forward-declared here, defined below, since
  * TickPeriodicPushes() needs it before its own definition appears. */
-static bool GsmLinkDown(uint32_t now);
+static bool BothLinksDown(uint32_t now);
 
 static void TickPeriodicPushes(uint32_t now)
 {
@@ -447,25 +556,25 @@ static void TickPeriodicPushes(uint32_t now)
 
     if (g_hmi.active_screen == SCR_04_TELEMETRY && now >= next_distance_push) {
         next_distance_push = now + TELEMETRY_DISTANCE_PUSH_MS;
-        /* Once the transmitter is truly gone (link down, same check used
-         * for the status bar), the last real distance sample is stale/
-         * meaningless — TickDistanceFromLinks() only ever updates
-         * g_hmi.distance_m when a fresh sample actually arrives, so
+        /* Once the transmitter is truly gone (both links down, same check
+         * used for the status bar), the last real distance sample is
+         * stale/meaningless — TickDistanceFromLinks() only ever updates
+         * g_hmi.distance_cm when a fresh sample actually arrives, so
          * without this check it would otherwise stay locked on whatever
          * was last received forever. Checked first/takes priority over
          * the out-of-range case below, since a stale sample's numeric
-         * value (>44m or not) says nothing real once the link itself is
+         * value (>45.00m or not) says nothing real once both links are
          * down. "DC" (disconnected) vs "OR" (out of range) — explicit
          * request, distinguishing "transmitter gone" from "transmitter
          * present but beyond the active range" instead of both showing
          * the same "--". */
-        if (GsmLinkDown(now)) {
+        if (BothLinksDown(now)) {
             DWIN_WriteVPString(VP_DISTANCE, "DC", NUMBER_TEXT_FIELD_BYTES);
         } else if (g_hmi.distance_cm > DISTANCE_MAX_ACTIVE_CM) {
             DWIN_WriteVPString(VP_DISTANCE, "OR", NUMBER_TEXT_FIELD_BYTES);
         } else {
-            char dist_str[16];
-            snprintf(dist_str, sizeof(dist_str), "%u.%02u", g_hmi.distance_cm / 100u, g_hmi.distance_cm % 100u);
+            char dist_str[12];
+            FormatDistanceText(dist_str, sizeof(dist_str), g_hmi.distance_cm);
             DWIN_WriteVPString(VP_DISTANCE, dist_str, NUMBER_TEXT_FIELD_BYTES);
         }
     }
@@ -485,16 +594,46 @@ static void TickPeriodicPushes(uint32_t now)
     }
 }
 
-/* GSM-only, recency-based link-health derivation — no live RSSI polling
- * (would need a second, independent AT+CSQ command competing with
- * GSM_MQTT_Poll()'s own receive path for the same UART/response buffer,
- * risking a dropped incoming message on collision; not worth it for a
- * signal-bars nicety on a project whose top priority is reliability).
- * Only meaningful once connected; otherwise conn_health just holds its
- * last value, same as before there was a real link to report on. */
+/* Maps whichever link is currently authoritative onto the status bar's
+ * coarse conn_mode/conn_health indicators. LoRa is checked first and
+ * wins whenever its rolling window reports LORA_LINK_STABLE — LoRa is the
+ * preferred link whenever it's in range, with the AWS/GSM path as the
+ * fallback (matches EnterScreen()'s SCR_02_CONNECTING comment). This check
+ * is deliberately NOT gated on the cloud link being connected — LoRa can
+ * be, and often is, ready before the MQTT session is. Only meaningful once
+ * at least one link is actually ready; otherwise conn_health/conn_mode
+ * just hold their last value, same as before there was a real link to
+ * report on.
+ *
+ * The cloud path's health stays recency-based (GSM_GetMsSinceLastMessage
+ * against fixed thresholds), no live RSSI polling (a second, independent
+ * AT+CSQ command would compete with GSM_MQTT_Poll()'s own receive path for
+ * the same UART/response buffer, risking a dropped incoming message; not
+ * worth it for a signal-bars nicety on a project whose top priority is
+ * reliability). LoRa has no RSSI reachable on this hardware, so its own
+ * rolling-window success count doubles as the health indicator instead —
+ * thresholds are LoRa's own scale (0-5 slots), not meant to line up
+ * numerically with the cloud path's time-based scale. */
 static void TickConnectionStatus(uint32_t now)
 {
+    if (LoRa_GetState() == LORA_LINK_STABLE) {
+        g_hmi.conn_mode = CONN_MODE_LORA;
+        uint8_t success = LoRa_GetWindowSuccessCount();
+        if (success >= 5u) {
+            g_hmi.conn_health = CONN_HEALTH_EXCELLENT;
+        } else if (success >= 4u) {
+            g_hmi.conn_health = CONN_HEALTH_GOOD;
+        } else {
+            g_hmi.conn_health = CONN_HEALTH_POOR; /* defensive — the dead
+                zone (3) can still be observed here via hysteresis, but
+                the exit threshold (<=2) demotes out of LORA_LINK_STABLE
+                before this would normally go lower */
+        }
+        return;
+    }
+
     if (GSM_GetState() == GSM_LINK_CONNECTED) {
+        g_hmi.conn_mode = CONN_MODE_GSM;
         uint32_t sinceMs = GSM_GetMsSinceLastMessage(now);
         if (sinceMs <= 2000u) {
             g_hmi.conn_health = CONN_HEALTH_EXCELLENT;
@@ -506,42 +645,53 @@ static void TickConnectionStatus(uint32_t now)
     }
 }
 
-/* Drains whatever GSM has most recently parsed into g_hmi.distance_cm.
- * Unread-since-last-call flag on the GSM side, so this never picks up a
- * stale leftover reading from before a device change. */
+/* Drains whatever each link has most recently parsed into
+ * g_hmi.distance_cm, taking whichever one is currently authoritative
+ * (g_hmi.conn_mode, set above). Both getters run every tick
+ * unconditionally, regardless of which is active — LoRa's is an "unread
+ * since last call" flag, so reading it only while LoRa is active would
+ * leave it holding a stale sample from before a handover; draining it
+ * every tick keeps both fresh so a switch never picks up a leftover
+ * reading from before it. */
 static void TickDistanceFromLinks(void)
 {
     uint16_t gsm_distance_cm;
-    if (GSM_GetLatestDistance(&gsm_distance_cm)) {
+    bool gsm_has_new = GSM_GetLatestDistance(&gsm_distance_cm);
+    uint16_t lora_distance_cm;
+    bool lora_has_new = LoRa_GetLatestDistance(&lora_distance_cm);
+
+    if (g_hmi.conn_mode == CONN_MODE_LORA) {
+        if (lora_has_new) {
+            g_hmi.distance_cm = lora_distance_cm;
+        }
+    } else if (gsm_has_new) {
         g_hmi.distance_cm = gsm_distance_cm;
     }
 }
 
-static bool GsmLinkDown(uint32_t now)
+static bool BothLinksDown(uint32_t now)
 {
     bool gsm_live = (GSM_GetState() == GSM_LINK_CONNECTED) &&
                     (GSM_GetMsSinceLastMessage(now) <= LINK_STALE_TIMEOUT_MS);
-    return !gsm_live;
+    bool lora_live = (LoRa_GetState() == LORA_LINK_STABLE) ||
+                     (g_hmi.conn_mode == CONN_MODE_LORA && LoRa_IsDeviceOnline(g_hmi.connected_device_num, now));
+    return !gsm_live && !lora_live;
 }
 
 /* Ported from Shunting_Receiver_v2's TickObstacleOverlay(), unchanged
- * design — same overlay technique as TickChargerOverlay():
- * g_hmi.active_screen deliberately stays SCR_04_TELEMETRY throughout,
- * only g_hmi.obstacle_overlay_active + a direct DWIN_SwitchPage() change.
+ * design — g_hmi.active_screen deliberately stays SCR_04_TELEMETRY
+ * throughout, only g_hmi.obstacle_overlay_active + a direct
+ * DWIN_SwitchPage() change.
  * This is what lets TickBuzzer()'s proximity/alarm tone and
  * TickPeriodicPushes()'s status-bar/distance writes keep running exactly
  * as they already do on Telemetry, and Volume -/+ / END SHUNTING keep
  * working via HandleTouch()'s existing SCR_04_TELEMETRY case — none of
  * that needs to change.
  *
- * Only evaluated during an actual live Telemetry session, and skipped
- * entirely while the charger overlay is up (charging already suspends
- * GSM polling, so no new samples would arrive anyway — this is a
- * defensive guard, not expected to matter in practice).
+ * Only evaluated during an actual live Telemetry session.
  *
  * Three states, tracked locally (PENDING doesn't need to be in g_hmi —
- * it's purely an internal debounce detail, same as e.g. charger_detect.c's
- * own debounce statics):
+ * it's purely an internal debounce detail):
  *
  * IDLE -> PENDING: the previous sample was a real reading
  * (<= DISTANCE_MAX_ACTIVE_M — reusing the constant that already means "a
@@ -590,15 +740,15 @@ static void TickObstacleOverlay(uint32_t now)
     static bool     s_pending;
     static uint32_t s_pending_since_tick;
 
-    bool telemetry_active = (g_hmi.active_screen == SCR_04_TELEMETRY) && !g_hmi.charger_overlay_active;
+    bool telemetry_active = (g_hmi.active_screen == SCR_04_TELEMETRY);
 
     if (!telemetry_active) {
         s_have_last_distance = false;
         s_pending = false;
         if (g_hmi.obstacle_overlay_active) {
-            /* Left Telemetry some other way (Change Device/End Shunting/
-             * charger plugged in) while the warning was up — clear it
-             * defensively rather than leaving it stuck active. */
+            /* Left Telemetry some other way (Change Device/End Shunting)
+             * while the warning was up — clear it defensively rather than
+             * leaving it stuck active. */
             g_hmi.obstacle_overlay_active = false;
         }
         return;
@@ -642,49 +792,11 @@ static void TickObstacleOverlay(uint32_t now)
     }
 }
 
-/* Ported from Shunting_Receiver_v2's TickChargerOverlay() — same overlay
- * technique used there: active_screen keeps advancing underneath (see
- * EnterScreen()'s charger_overlay_active guard) while the physical
- * display stays pinned on page 13. On unplug, this is a genuine fresh
- * start rather than a resumed session — a separate physical power switch
- * (outside firmware's control) stays off during charging on this
- * hardware, so there's no session to return to. Reinitializes GSM the
- * same way it would from a cold boot; no LoRa_Reset() here since this
- * port has no LoRa. */
-static void TickChargerOverlay(uint32_t now)
-{
-    static uint32_t next_charge_text_push;
-
-    if (g_hmi.charger_plugged && !g_hmi.charger_overlay_active) {
-        g_hmi.charger_overlay_active = true;
-        DWIN_SwitchPage(PAGE_13_CHARGER_PLUGGED);
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%u", g_hmi.charge_pct);
-        DWIN_WriteVPString(VP_CHARGE_PCT_TEXT, buf, CHARGE_PCT_TEXT_FIELD_BYTES);
-        next_charge_text_push = now + CHARGE_TEXT_PUSH_INTERVAL_MS;
-        return;
-    }
-
-    if (!g_hmi.charger_plugged && g_hmi.charger_overlay_active) {
-        g_hmi.charger_overlay_active = false;
-        GSM_Reset();
-        ScreenSM_ForceStartupReset(now);
-        return;
-    }
-
-    if (g_hmi.charger_overlay_active && now >= next_charge_text_push) {
-        next_charge_text_push = now + CHARGE_TEXT_PUSH_INTERVAL_MS;
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%u", g_hmi.charge_pct);
-        DWIN_WriteVPString(VP_CHARGE_PCT_TEXT, buf, CHARGE_PCT_TEXT_FIELD_BYTES);
-    }
-}
-
 /* Ported from Shunting_Receiver_v2's TickBuzzer() — distance-band beep-
  * cadence thresholds (180/200/250/400ms) are its hand-verified "sounds
- * right" values, ported as-is. Its BothLinksDown() (GSM-or-LoRa) becomes
- * GsmLinkDown() here since this port has no LoRa — same "is the link to
- * the transmitter actually alive" concept, just one link instead of two. */
+ * right" values, ported as-is. BothLinksDown() (cloud-or-LoRa) is the same
+ * "is the link to the transmitter actually alive" concept the status bar
+ * already uses, just checked here for the continuous-alarm-tone case. */
 static void TickBuzzer(uint32_t now)
 {
     Buzzer_SetVolume(g_hmi.volume_pct);
@@ -695,7 +807,7 @@ static void TickBuzzer(uint32_t now)
         return;
     }
 
-    if (GsmLinkDown(now)) {
+    if (BothLinksDown(now)) {
         /* Total link loss — a steady, non-toggling alarm tone rather
          * than the intermittent proximity cadence, so it reads as
          * unmistakably "we've lost the transmitter," not "getting close
@@ -737,6 +849,7 @@ void ScreenSM_ForceStartupReset(uint32_t now_ms)
     strcpy(g_hmi.connected_device_name, "--");
     memset(g_hmi.device_online, 0, sizeof(g_hmi.device_online));
     g_hmi.conn_health = CONN_HEALTH_POOR;
+    g_hmi.conn_mode = CONN_MODE_GSM;
     g_hmi.distance_cm = 50000u; /* same "no data yet" fallback as HmiState_Init() */
     EnterScreen(SCR_00_STARTUP, true, now_ms);
 }
@@ -752,7 +865,6 @@ void ScreenSM_Tick(uint32_t now_ms)
     TickDistanceFromLinks();
     TickObstacleOverlay(now_ms);
     TickTimers(now_ms);
-    TickChargerOverlay(now_ms);
     TickPeriodicPushes(now_ms);
     TickBuzzer(now_ms);
 }
