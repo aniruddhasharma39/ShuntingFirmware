@@ -114,14 +114,9 @@ static void WriteVPNumberText(uint16_t vp, uint32_t value, uint8_t field_bytes)
  * keep working from the exact value, not from this rounded text. */
 static void FormatDistanceText(char *out, size_t out_len, uint16_t cm)
 {
-    uint32_t half_metres = ((uint32_t)cm + 25u) / 50u;   /* nearest 0.5m */
-    if (half_metres < 20u) {
-        snprintf(out, out_len, "%lu.%c",
-                 (unsigned long)(half_metres / 2u),
-                 (half_metres & 1u) ? '5' : '0');
-    } else {
-        snprintf(out, out_len, "%lu", (unsigned long)(((uint32_t)cm + 50u) / 100u));
-    }
+    uint32_t m = cm / 100u;
+    uint32_t frac = cm % 100u;
+    snprintf(out, out_len, "%lu.%02lu", (unsigned long)m, (unsigned long)frac);
 }
 
 /* Same as WriteVPNumberText() but appends "%" — used for battery/charge
