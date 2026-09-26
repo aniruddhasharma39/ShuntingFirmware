@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 #include "tf02pro.h"
 #include "gsm_mqtt.h"
 #include "aws_manager.h"
